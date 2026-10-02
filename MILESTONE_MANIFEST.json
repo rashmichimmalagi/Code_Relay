@@ -1,0 +1,26 @@
+{
+  "project": "CodeRelay",
+  "milestone": 1,
+  "scope": [
+    "React + TypeScript + Vite + Tailwind CSS",
+    "InsForge email/password authentication",
+    "Email verification flow",
+    "Protected student dashboard",
+    "Team registration",
+    "PostgreSQL RLS",
+    "Database-level team-number uniqueness",
+    "One-team-per-authenticated-student constraint"
+  ],
+  "excluded": [
+    "Round 2 Code Relay",
+    "Monaco Editor",
+    "Judge0",
+    "Question allocation",
+    "Hidden test cases",
+    "Scoring",
+    "Leaderboard",
+    "Admin dashboard",
+    "Anti-cheating"
+  ],
+  "live_verification": "Not executed: this chat has no connected InsForge project/GitHub workspace and npm registry access timed out."
+}
