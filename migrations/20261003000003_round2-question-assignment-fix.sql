@@ -1,59 +1,58 @@
-CREATE OR REPLACE FUNCTION public.save_round2_team_code_for_member(
-  p_session_id uuid,
-  p_team_id uuid,
-  p_question_id uuid,
-  p_language text,
-  p_code text
+-- CodeRelay: Fix 8-question modulo assignment for all teams (Team 1-8, then repeating for Team 9+)
+-- This ensures teams with team_number > 8 (e.g. 9, 13, 21, 30) map to ((team_number - 1) % 8)
+-- using the 8 approved questions ordered by created_at ASC.
+
+CREATE OR REPLACE FUNCTION public.get_round2_question_for_team(p_team_id uuid)
+RETURNS TABLE(
+  question_id uuid,
+  title text,
+  question_text text,
+  function_signature_c text,
+  function_signature_python text,
+  function_signature_java text,
+  interface_status text
 )
-RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path TO 'public'
-AS $function$
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_team_number integer;
+  v_offset integer;
 BEGIN
   IF NOT public.coderelay_user_is_team_member(p_team_id) THEN
-    RAISE EXCEPTION 'You are not a member of this approved team';
+    RETURN;
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM public.round2_sessions s
-    WHERE s.id = p_session_id
-      AND s.phase = 'CODING'
-      AND s.coding_stage IN ('STUDENT_2', 'STUDENT_3')
-      AND s.phase_started_at IS NOT NULL
-      AND clock_timestamp() < s.phase_started_at + (
-        (
-          CASE
-            WHEN s.coding_stage = 'STUDENT_3'
-              THEN s.student3_duration_seconds
-            ELSE s.coding_duration_seconds
-          END
-          + COALESCE(s.coding_extension_seconds, s.phase_extension_seconds, 0)
-        ) * INTERVAL '1 second'
-      )
-  ) THEN
-    RAISE EXCEPTION 'Round 2 coding time has expired or is not active';
+  SELECT t.team_number
+  INTO v_team_number
+  FROM public.teams t
+  WHERE t.id = p_team_id
+    AND t.status = 'APPROVED'
+    AND t.created_by = auth.uid();
+
+  IF v_team_number IS NULL OR v_team_number <= 0 THEN
+    RETURN;
   END IF;
 
-  UPDATE public.round2_team_code
-  SET language = p_language,
-      code = p_code,
-      question_id = p_question_id,
-      updated_at = now()
-  WHERE session_id = p_session_id
-    AND team_id = p_team_id;
+  v_offset := (v_team_number - 1) % 8;
 
-  IF NOT FOUND THEN
-    INSERT INTO public.round2_team_code (
-      session_id, team_id, question_id, language, code, created_by
-    )
-    VALUES (
-      p_session_id, p_team_id, p_question_id, p_language, p_code, auth.uid()
-    );
-  END IF;
+  RETURN QUERY
+  SELECT
+    q.id AS question_id,
+    q.title,
+    q.question_text,
+    q.function_signature_c,
+    q.function_signature_python,
+    q.function_signature_java,
+    q.interface_status
+  FROM public.round2_questions q
+  WHERE q.interface_status = 'APPROVED'
+  ORDER BY q.created_at ASC
+  OFFSET v_offset
+  LIMIT 1;
 END;
-$function$;
+$$;
 
 CREATE OR REPLACE FUNCTION public.save_round2_code_run(
   p_session_id uuid,
@@ -73,10 +72,11 @@ CREATE OR REPLACE FUNCTION public.save_round2_code_run(
 RETURNS SETOF public.round2_code_runs
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path TO 'public', 'pg_temp'
-AS $function$
+SET search_path = public, pg_temp
+AS $$
 DECLARE
   v_user_id uuid;
+  v_team_number integer;
   v_expected_question_id uuid;
   v_run_id uuid;
 BEGIN
@@ -90,13 +90,14 @@ BEGIN
     RAISE EXCEPTION 'Unsupported programming language';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM public.teams AS t
-    WHERE t.id = p_team_id
-      AND t.created_by = v_user_id
-      AND t.status = 'APPROVED'
-  ) THEN
+  SELECT t.team_number
+  INTO v_team_number
+  FROM public.teams AS t
+  WHERE t.id = p_team_id
+    AND t.created_by = v_user_id
+    AND t.status = 'APPROVED';
+
+  IF v_team_number IS NULL THEN
     RAISE EXCEPTION 'You are not authorized for this team';
   END IF;
 
@@ -119,16 +120,10 @@ BEGIN
 
   SELECT q.id
   INTO v_expected_question_id
-  FROM public.teams AS t
-  JOIN public.round2_questions AS q
-    ON q.interface_status = 'APPROVED'
-  WHERE t.id = p_team_id
+  FROM public.round2_questions AS q
+  WHERE q.interface_status = 'APPROVED'
   ORDER BY q.created_at ASC
-  OFFSET (
-    SELECT ((team_number - 1) % 8)
-    FROM public.teams
-    WHERE id = p_team_id
-  )
+  OFFSET ((v_team_number - 1) % 8)
   LIMIT 1;
 
   IF v_expected_question_id IS NULL THEN
@@ -180,4 +175,4 @@ BEGIN
   FROM public.round2_code_runs AS r
   WHERE r.id = v_run_id;
 END;
-$function$;
+$$;

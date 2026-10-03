@@ -1,159 +1,206 @@
-import { createClient } from "npm:@insforge/sdk";
+/*
+ * CodeRelay Round 2 - secure server judge
+ *
+ * IMPORTANT:
+ * - This file intentionally uses plain JavaScript syntax inside a .ts file.
+ * - There is NO SDK import. It talks to InsForge through its HTTP API.
+ * - This avoids dashboard parser/import problems and keeps the function
+ *   directly deployable as an InsForge Edge Function.
+ *
+ * Required secrets:
+ *   JUDGE0_URL
+ *   JUDGE0_AUTH_TOKEN   (optional if your Judge0 instance does not require it)
+ *   API_KEY             (InsForge project API key; server-side only)
+ *
+ * Required InsForge env:
+ *   INSFORGE_URL
+ *
+ * Request body:
+ * {
+ *   "session_id": "...",
+ *   "team_id": "...",
+ *   "question_id": "...",
+ *   "language": "c" | "python",
+ *   "implementation": "...",
+ *   "final_submission": false
+ * }
+ */
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-type Language = "c" | "python";
-
-type RunRequest = {
-  session_id: string;
-  team_id: string;
-  question_id: string;
-  language: Language;
-  implementation: string;
-  final_submission?: boolean;
+const LANGUAGE_IDS = {
+  c: 50,
+  python: 71,
 };
 
-type CodingSession = {
-  phase: string;
-  coding_stage: string;
-  phase_started_at: string | null;
-  coding_duration_seconds: number;
-  student3_duration_seconds: number;
-  coding_extension_seconds: number;
-  phase_extension_seconds: number;
-};
+const EDITOR_STORAGE_PREFIX = "__CODERELAY_EDITOR_V1__";
 
-type TestCase = {
-  id: string;
-  input_data: Record<string, unknown>;
-  expected_output: unknown;
-  is_hidden: boolean;
-  created_at?: string;
-};
-
-type JudgeResult = {
-  status?: { id?: number; description?: string };
-  stdout?: string | null;
-  stderr?: string | null;
-  compile_output?: string | null;
-  message?: string | null;
-  time?: string | null;
-  memory?: number | null;
-};
-
-const LANGUAGE_IDS: Record<Language, number> = { c: 50, python: 71 };
-
-function json(data: unknown, status = 200) {
+function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
   });
 }
 
-function token(req: Request) {
+function getBearerToken(req) {
   const value = req.headers.get("authorization");
-  return value?.startsWith("Bearer ") ? value.slice(7).trim() : null;
+  if (!value || !value.startsWith("Bearer ")) return null;
+  return value.slice(7).trim() || null;
 }
 
-function isCodingTimeExpired(session: CodingSession, now = Date.now()) {
-  if (!session.phase_started_at) return true;
+function requiredEnv(name) {
+  const value = Deno.env.get(name);
+  if (!value) throw new Error(`${name} is not configured`);
+  return value.replace(/\/+$/, "");
+}
 
-  const startedAt = Date.parse(session.phase_started_at);
-  const stageDuration = session.coding_stage === "STUDENT_3"
-    ? Number(session.student3_duration_seconds)
-    : Number(session.coding_duration_seconds);
-  const extension = Number(
-    session.coding_extension_seconds ?? session.phase_extension_seconds ?? 0,
+async function insforgeRequest(baseUrl, path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.token
+        ? { Authorization: `Bearer ${options.token}` }
+        : {}),
+      ...(options.prefer ? { Prefer: options.prefer } : {}),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+
+  const text = await response.text();
+
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      typeof data === "object" && data
+        ? data.message ?? data.error ?? JSON.stringify(data)
+        : String(data ?? response.statusText);
+
+    const error = new Error(
+      `InsForge request failed (${response.status}): ${message}`,
+    );
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
+
+  return data;
+}
+
+async function dbRpc(baseUrl, token, functionName, params = {}) {
+  return insforgeRequest(
+    baseUrl,
+    `/api/database/rpc/${encodeURIComponent(functionName)}`,
+    {
+      method: "POST",
+      token,
+      body: params,
+    },
   );
-  const deadline = startedAt + (stageDuration + extension) * 1000;
-
-  return !Number.isFinite(deadline) || now >= deadline;
 }
 
-async function loadCodingSession(
-  db: ReturnType<typeof createClient>,
-  sessionId: string,
-) {
-  const result = await db.database
-    .from("round2_sessions")
-    .select("phase,coding_stage,phase_started_at,coding_duration_seconds,student3_duration_seconds,coding_extension_seconds,phase_extension_seconds")
-    .eq("id", sessionId)
-    .maybeSingle();
-
-  if (result.error) throw result.error;
-  return result.data as CodingSession | null;
+async function dbRecords(baseUrl, token, table, query = "") {
+  return insforgeRequest(
+    baseUrl,
+    `/api/database/records/${encodeURIComponent(table)}${query ? `?${query}` : ""}`,
+    {
+      method: "GET",
+      token,
+    },
+  );
 }
 
-function py(value: unknown) {
+async function dbInsert(baseUrl, token, table, rows) {
+  return insforgeRequest(
+    baseUrl,
+    `/api/database/records/${encodeURIComponent(table)}`,
+    {
+      method: "POST",
+      token,
+      prefer: "return=representation",
+      body: rows,
+    },
+  );
+}
+
+async function dbUpdate(baseUrl, token, table, query, payload) {
+  return insforgeRequest(
+    baseUrl,
+    `/api/database/records/${encodeURIComponent(table)}?${query}`,
+    {
+      method: "PATCH",
+      token,
+      prefer: "return=representation",
+      body: payload,
+    },
+  );
+}
+
+function py(value) {
   return JSON.stringify(value)
     .replace(/\btrue\b/g, "True")
     .replace(/\bfalse\b/g, "False")
     .replace(/\bnull\b/g, "None");
 }
 
-function cArray(value: unknown) {
-  const values = value as number[];
-  return `{${values.join(", ")}}`;
+function cArray(value) {
+  if (!Array.isArray(value)) return `{${String(value)}}`;
+  return `{${value.join(", ")}}`;
 }
 
-/*
- * These helpers generate C code for the Judge0 wrapper.
- *
- * IMPORTANT:
- * cPrintIntArray / cPrintStringArray are JavaScript/TypeScript helper
- * functions that generate C source code. They are NOT functions supplied
- * by the student. The previous handler referenced them without defining
- * them, which caused the Edge Function itself to throw:
- *
- *   ReferenceError: cPrintIntArray is not defined
- *
- * before Judge0 could execute the student's C program.
- */
-function cPrintIntArray(arrayName: string, lengthExpression: string) {
-  return `
-  printf("[");
-  for (int i = 0; i < ${lengthExpression}; i++) {
-    if (i) printf(",");
-    printf("%d", ${arrayName}[i]);
-  }
-  printf("]\\n");
-`.trim();
-}
-
-function cPrintStringArray(arrayName: string, lengthExpression: string) {
-  return `
-  printf("[");
-  for (int i = 0; i < ${lengthExpression}; i++) {
-    if (i) printf(",");
-    printf("\\"%s\\"", ${arrayName}[i]);
-  }
-  printf("]\\n");
-`.trim();
-}
-
-function javaArray(value: unknown): string {
+function javaArray(value) {
   if (!Array.isArray(value)) return String(value);
   return `{${value.map((item) => javaArray(item)).join(", ")}}`;
 }
 
-const EDITOR_STORAGE_PREFIX = "__CODERELAY_EDITOR_V1__";
+/*
+ * These helpers are part of the server-generated C harness.
+ * They must exist before cSource() is called.
+ */
+function cPrintIntArray(arrayName, lengthExpression) {
+  return `
+printf("[");
+for (int i = 0; i < ${lengthExpression}; i++) {
+    if (i) printf(",");
+    printf("%d", ${arrayName}[i]);
+}
+printf("]\\n");
+`.trim();
+}
 
-type StoredImplementation = {
-  before: string;
-  body: string;
-  after: string;
-};
+function cPrintStringArray(arrayName, lengthExpression) {
+  return `
+printf("[");
+for (int i = 0; i < ${lengthExpression}; i++) {
+    if (i) printf(",");
+    printf("\\\"%s\\\"", ${arrayName}[i]);
+}
+printf("]\\n");
+`.trim();
+}
 
-function parseStoredImplementation(implementation: string): StoredImplementation {
+function parseStoredImplementation(implementation) {
   if (implementation.startsWith(EDITOR_STORAGE_PREFIX)) {
     try {
       const parsed = JSON.parse(
         implementation.slice(EDITOR_STORAGE_PREFIX.length),
-      ) as Partial<StoredImplementation>;
+      );
 
       return {
         before: typeof parsed.before === "string" ? parsed.before : "",
@@ -161,7 +208,7 @@ function parseStoredImplementation(implementation: string): StoredImplementation
         after: typeof parsed.after === "string" ? parsed.after : "",
       };
     } catch {
-      // Fall back to legacy body-only storage.
+      // Legacy body-only format.
     }
   }
 
@@ -172,8 +219,8 @@ function parseStoredImplementation(implementation: string): StoredImplementation
   };
 }
 
-function bodyOf(implementation: string) {
-  const normalized = implementation
+function bodyOf(implementation) {
+  const normalized = String(implementation ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
     .replace(/\\t/g, "    ")
@@ -181,26 +228,6 @@ function bodyOf(implementation: string) {
 
   if (!normalized) return "";
 
-  /*
-   * The browser editor displays the implementation inside the function,
-   * so every body line normally carries the function's visual indentation.
-   * Remove only the COMMON leading indentation here.
-   *
-   * Example:
-   *
-   *     j = 0
-   *     for i in range(...):
-   *         nums1[i] = nums2[j]
-   *
-   * becomes:
-   *
-   * j = 0
-   * for i in range(...):
-   *     nums1[i] = nums2[j]
-   *
-   * Then the language wrapper adds the function indentation exactly once.
-   * Relative/nested indentation is preserved.
-   */
   const lines = normalized.split("\n");
   const nonEmpty = lines.filter((line) => line.trim().length > 0);
 
@@ -221,12 +248,13 @@ function bodyOf(implementation: string) {
     .trim();
 }
 
-function pythonSource(signature: string, implementation: string, test: TestCase, kind: string) {
+function pythonSource(signature, implementation, test, kind) {
   const input = test.input_data;
   const stored = parseStoredImplementation(implementation);
   const body = bodyOf(stored.body);
   const helpersBefore = stored.before ? `${stored.before}\n\n` : "";
   const helpersAfter = stored.after ? `\n\n${stored.after}` : "";
+
   let invocation = "";
 
   switch (kind) {
@@ -250,6 +278,7 @@ print("CR:" + str(nums1 == ${py(test.expected_output)}))
 `;
       }
       break;
+
     case "return_string_array":
       invocation = `
 result = fizz_buzz(${py(input.n)})
@@ -257,6 +286,7 @@ print("OUT:" + json.dumps(result, separators=(",", ":")))
 print("CR:" + str(result == ${py(test.expected_output)}))
 `;
       break;
+
     case "return_integer":
       if ("mat" in input) {
         invocation = `
@@ -272,6 +302,7 @@ print("CR:" + str(result == ${py(test.expected_output)}))
 `;
       }
       break;
+
     case "return_integer_array":
       invocation = `
 result = left_right_difference(${py(input.nums)})
@@ -279,6 +310,7 @@ print("OUT:" + json.dumps(result, separators=(",", ":")))
 print("CR:" + str(result == ${py(test.expected_output)}))
 `;
       break;
+
     case "return_double":
       invocation = `
 result = find_median_sorted_arrays(${py(input.nums1)}, ${py(input.nums2)})
@@ -286,67 +318,116 @@ print("OUT:" + json.dumps(result))
 print("CR:" + str(abs(result - ${py(test.expected_output)}) < 0.000001))
 `;
       break;
+
     case "remove_element":
       invocation = `
 nums = ${py(input.nums)}
 k = remove_element(nums, ${py(input.val)})
 actual = {"k": k, "elements": sorted(nums[:k])}
-expected = {"k": ${py((test.expected_output as { k: number }).k)}, "elements": sorted(${py((test.expected_output as { elements: number[] }).elements)})}
+expected = {"k": ${py(test.expected_output.k)}, "elements": sorted(${py(
+        test.expected_output.elements,
+      )})}
 print("OUT:" + json.dumps(actual, separators=(",", ":")))
 print("CR:" + str(actual == expected))
 `;
       break;
+
     default:
       throw new Error(`Unsupported Python judge kind: ${kind}`);
   }
 
-  return `import json\n\n${helpersBefore}${signature}\n${body.split("\n").map((line) => line ? `    ${line}` : "").join("\n")}${helpersAfter}\n${invocation}`.trim();
+  const indentedBody = body
+    .split("\n")
+    .map((line) => (line ? `    ${line}` : ""))
+    .join("\n");
+
+  return `
+import json
+
+${helpersBefore}${signature}
+${indentedBody}${helpersAfter}
+${invocation}
+`.trim();
 }
 
-function cSource(signature: string, implementation: string, test: TestCase, kind: string) {
+function cSource(signature, implementation, test, kind) {
   const input = test.input_data;
   const stored = parseStoredImplementation(implementation);
   const helpersBefore = stored.before ? `${stored.before}\n` : "";
   const helpersAfter = stored.after ? `\n${stored.after}` : "";
-  const body = bodyOf(stored.body).split("\n").map((line) => line ? `    ${line}` : "").join("\n");
+  const body = bodyOf(stored.body)
+    .split("\n")
+    .map((line) => (line ? `    ${line}` : ""))
+    .join("\n");
 
   if (kind === "mutating_array") {
     if ("k" in input) {
+      const expected = Array.isArray(test.expected_output)
+        ? test.expected_output
+        : [];
+
       return `
 #include <stdio.h>
 #include <stdlib.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int nums[] = ${cArray(input.nums)};
-    rotate(nums, ${Number((input.nums as number[]).length)}, ${Number(input.k)});
-    int expected[] = ${cArray(test.expected_output)};
+    rotate(nums, ${(input.nums ?? []).length}, ${Number(input.k)});
+    int expected[] = ${cArray(expected)};
     int passed = 1;
-    for (int i = 0; i < ${((test.expected_output as number[]).length)}; i++) if (nums[i] != expected[i]) passed = 0;
+
+    for (int i = 0; i < ${expected.length}; i++) {
+        if (nums[i] != expected[i]) passed = 0;
+    }
+
     printf("OUT:");
-    ${cPrintIntArray("nums", String(((test.expected_output as number[]).length)))}
+    ${cPrintIntArray("nums", String(expected.length))}
     printf("CR:%s\\n", passed ? "True" : "False");
     return 0;
 }
 `.trim();
     }
 
+    const expected = Array.isArray(test.expected_output)
+      ? test.expected_output
+      : [];
+
     return `
 #include <stdio.h>
 #include <stdlib.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int nums1[] = ${cArray(input.nums1)};
     int nums2[] = ${cArray(input.nums2)};
-    merge(nums1, ${Number((input.nums1 as number[]).length)}, ${Number(input.m)}, nums2, ${Number((input.nums2 as number[]).length)}, ${Number(input.n)});
-    int expected[] = ${cArray(test.expected_output)};
+
+    merge(
+        nums1,
+        ${(input.nums1 ?? []).length},
+        ${Number(input.m)},
+        nums2,
+        ${(input.nums2 ?? []).length},
+        ${Number(input.n)}
+    );
+
+    int expected[] = ${cArray(expected)};
     int passed = 1;
-    for (int i = 0; i < ${((test.expected_output as number[]).length)}; i++) if (nums1[i] != expected[i]) passed = 0;
+
+    for (int i = 0; i < ${expected.length}; i++) {
+        if (nums1[i] != expected[i]) passed = 0;
+    }
+
     printf("OUT:");
-    ${cPrintIntArray("nums1", String(((test.expected_output as number[]).length)))}
+    ${cPrintIntArray("nums1", String(expected.length))}
     printf("CR:%s\\n", passed ? "True" : "False");
     return 0;
 }
@@ -354,26 +435,40 @@ ${helpersAfter}int main(void) {
   }
 
   if (kind === "return_string_array") {
-    const expected = test.expected_output as string[];
+    const expected = Array.isArray(test.expected_output)
+      ? test.expected_output
+      : [];
+
     const literals = expected.map((s) => JSON.stringify(s)).join(", ");
+
     return `
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int returnSize = 0;
     char **result = fizzBuzz(${Number(input.n)}, &returnSize);
+
     const char *expected[] = {${literals}};
     int passed = returnSize == ${expected.length};
-    for (int i = 0; passed && i < ${expected.length}; i++) if (strcmp(result[i], expected[i]) != 0) passed = 0;
+
+    for (int i = 0; passed && i < ${expected.length}; i++) {
+        if (strcmp(result[i], expected[i]) != 0) passed = 0;
+    }
+
     printf("OUT:");
     ${cPrintStringArray("result", "returnSize")}
     printf("CR:%s\\n", passed ? "True" : "False");
+
     for (int i = 0; i < returnSize; i++) free(result[i]);
     free(result);
+
     return 0;
 }
 `.trim();
@@ -381,21 +476,35 @@ ${helpersAfter}int main(void) {
 
   if (kind === "return_integer") {
     if ("mat" in input) {
-      const mat = input.mat as number[][];
+      const mat = Array.isArray(input.mat) ? input.mat : [];
       const rows = mat.map((r) => `{${r.join(", ")}}`).join(", ");
+      const cols = mat[0]?.length ?? 0;
+
       return `
 #include <stdio.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
-    int data[][${mat[0]?.length ?? 0}] = {${rows}};
+${helpersAfter}
+
+int main(void) {
+    int data[][${cols}] = {${rows}};
     int *ptrs[${mat.length}];
-    for (int i = 0; i < ${mat.length}; i++) ptrs[i] = data[i];
-    int cols = ${mat[0]?.length ?? 0};
-    int result = diagonalSum(ptrs, ${mat.length}, &cols);
+
+    for (int i = 0; i < ${mat.length}; i++) {
+        ptrs[i] = data[i];
+    }
+
+    int colsValue = ${cols};
+    int result = diagonalSum(ptrs, ${mat.length}, &colsValue);
+
     printf("OUT:%d\\n", result);
-    printf("CR:%s\\n", result == ${Number(test.expected_output)} ? "True" : "False");
+    printf(
+        "CR:%s\\n",
+        result == ${Number(test.expected_output)} ? "True" : "False"
+    );
+
     return 0;
 }
 `.trim();
@@ -403,36 +512,65 @@ ${helpersAfter}int main(void) {
 
     return `
 #include <stdio.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int gain[] = ${cArray(input.gain)};
-    int result = largestAltitude(gain, ${Number((input.gain as number[]).length)});
+    int result = largestAltitude(
+        gain,
+        ${(input.gain ?? []).length}
+    );
+
     printf("OUT:%d\\n", result);
-    printf("CR:%s\\n", result == ${Number(test.expected_output)} ? "True" : "False");
+    printf(
+        "CR:%s\\n",
+        result == ${Number(test.expected_output)} ? "True" : "False"
+    );
+
     return 0;
 }
 `.trim();
   }
 
   if (kind === "return_integer_array") {
+    const expected = Array.isArray(test.expected_output)
+      ? test.expected_output
+      : [];
+
     return `
 #include <stdio.h>
 #include <stdlib.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int nums[] = ${cArray(input.nums)};
     int returnSize = 0;
-    int *result = leftRightDifference(nums, ${Number((input.nums as number[]).length)}, &returnSize);
-    int expected[] = ${cArray(test.expected_output)};
-    int passed = returnSize == ${((test.expected_output as number[]).length)};
-    for (int i = 0; passed && i < returnSize; i++) if (result[i] != expected[i]) passed = 0;
+
+    int *result = leftRightDifference(
+        nums,
+        ${(input.nums ?? []).length},
+        &returnSize
+    );
+
+    int expected[] = ${cArray(expected)};
+    int passed = returnSize == ${expected.length};
+
+    for (int i = 0; passed && i < returnSize; i++) {
+        if (result[i] != expected[i]) passed = 0;
+    }
+
     printf("OUT:");
     ${cPrintIntArray("result", "returnSize")}
     printf("CR:%s\\n", passed ? "True" : "False");
+
     free(result);
     return 0;
 }
@@ -443,45 +581,80 @@ ${helpersAfter}int main(void) {
     return `
 #include <stdio.h>
 #include <math.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int nums1[] = ${cArray(input.nums1)};
     int nums2[] = ${cArray(input.nums2)};
-    double result = findMedianSortedArrays(nums1, ${Number((input.nums1 as number[]).length)}, nums2, ${Number((input.nums2 as number[]).length)});
+
+    double result = findMedianSortedArrays(
+        nums1,
+        ${(input.nums1 ?? []).length},
+        nums2,
+        ${(input.nums2 ?? []).length}
+    );
+
     printf("OUT:%g\\n", result);
-    printf("CR:%s\\n", fabs(result - ${Number(test.expected_output)}) < 0.000001 ? "True" : "False");
+    printf(
+        "CR:%s\\n",
+        fabs(result - ${Number(test.expected_output)}) < 0.000001
+          ? "True"
+          : "False"
+    );
+
     return 0;
 }
 `.trim();
   }
 
   if (kind === "remove_element") {
-    const expected = test.expected_output as { k: number; elements: number[] };
+    const expected = test.expected_output ?? { k: 0, elements: [] };
+
     return `
 #include <stdio.h>
 #include <stdlib.h>
+
 ${helpersBefore}${signature} {
 ${body}
 }
-${helpersAfter}int main(void) {
+${helpersAfter}
+
+int main(void) {
     int nums[] = ${cArray(input.nums)};
-    int k = removeElement(nums, ${Number((input.nums as number[]).length)}, ${Number(input.val)});
-    int expected[] = ${cArray(expected.elements)};
-    int passed = k == ${expected.k};
+
+    int k = removeElement(
+        nums,
+        ${(input.nums ?? []).length},
+        ${Number(input.val)}
+    );
+
+    int expected[] = ${cArray(expected.elements ?? [])};
+    int passed = k == ${Number(expected.k)};
+
     for (int i = 0; passed && i < k; i++) {
         int found = 0;
-        for (int j = 0; j < ${expected.elements.length}; j++) if (nums[i] == expected[j]) found = 1;
+
+        for (int j = 0; j < ${(expected.elements ?? []).length}; j++) {
+            if (nums[i] == expected[j]) found = 1;
+        }
+
         if (!found) passed = 0;
     }
+
     printf("OUT:{\\\"k\\\":%d,\\\"elements\\\":[", k);
+
     for (int i = 0; i < k; i++) {
         if (i) printf(",");
         printf("%d", nums[i]);
     }
+
     printf("]}\\n");
     printf("CR:%s\\n", passed ? "True" : "False");
+
     return 0;
 }
 `.trim();
@@ -490,301 +663,331 @@ ${helpersAfter}int main(void) {
   throw new Error(`Unsupported C judge kind: ${kind}`);
 }
 
-function javaSource(signature: string, implementation: string, test: TestCase, kind: string) {
-  const input = test.input_data;
-  const stored = parseStoredImplementation(implementation);
-  const helpersBefore = stored.before ? `${stored.before}\n    ` : "";
-  const helpersAfter = stored.after ? `\n    ${stored.after}` : "";
-  const body = bodyOf(stored.body).split("\n").map((line) => line ? `        ${line}` : "").join("\n");
-  let invocation = "";
-
-  switch (kind) {
-    case "mutating_array":
-      if ("k" in input) {
-        invocation = `
-int[] nums = ${javaArray(input.nums)};
-solution.rotate(nums, ${Number(input.k)});
-int[] expected = ${javaArray(test.expected_output)};
-System.out.println("OUT:" + Arrays.toString(nums));
-        System.out.println("CR:" + Arrays.equals(nums, expected));
-`;
-      } else {
-        invocation = `
-int[] nums1 = ${javaArray(input.nums1)};
-int[] nums2 = ${javaArray(input.nums2)};
-solution.merge(nums1, ${Number(input.m)}, nums2, ${Number(input.n)});
-int[] expected = ${javaArray(test.expected_output)};
-System.out.println("OUT:" + Arrays.toString(nums1));
-System.out.println("CR:" + Arrays.equals(nums1, expected));
-`;
-      }
-      break;
-    case "return_string_array":
-      invocation = `
-List<String> result = solution.fizzBuzz(${Number(input.n)});
-List<String> expected = Arrays.asList(${(test.expected_output as string[]).map((x) => JSON.stringify(x)).join(", ")});
-System.out.println("OUT:" + result);
-System.out.println("CR:" + result.equals(expected));
-`;
-      break;
-    case "return_integer":
-      if ("mat" in input) {
-        invocation = `
-int[][] mat = ${javaArray(input.mat)};
-int result = solution.diagonalSum(mat);
-System.out.println("OUT:" + result);
-System.out.println("CR:" + (result == ${Number(test.expected_output)}));
-`;
-      } else {
-        invocation = `
-int[] gain = ${javaArray(input.gain)};
-int result = solution.largestAltitude(gain);
-System.out.println("OUT:" + result);
-System.out.println("CR:" + (result == ${Number(test.expected_output)}));
-`;
-      }
-      break;
-    case "return_integer_array":
-      invocation = `
-int[] nums = ${javaArray(input.nums)};
-int[] result = solution.leftRightDifference(nums);
-int[] expected = ${javaArray(test.expected_output)};
-System.out.println("OUT:" + Arrays.toString(result));
-System.out.println("CR:" + Arrays.equals(result, expected));
-`;
-      break;
-    case "return_double":
-      invocation = `
-int[] nums1 = ${javaArray(input.nums1)};
-int[] nums2 = ${javaArray(input.nums2)};
-double result = solution.findMedianSortedArrays(nums1, nums2);
-System.out.println("OUT:" + result);
-System.out.println("CR:" + (Math.abs(result - ${Number(test.expected_output)}) < 0.000001));
-`;
-      break;
-    case "remove_element":
-      {
-        const expected = test.expected_output as { k: number; elements: number[] };
-        invocation = `
-int[] nums = ${javaArray(input.nums)};
-int k = solution.removeElement(nums, ${Number(input.val)});
-int expectedK = ${expected.k};
-int[] expected = ${javaArray(expected.elements)};
-boolean passed = k == expectedK;
-if (passed) {
-    int[] actual = Arrays.copyOf(nums, k);
-    Arrays.sort(actual);
-    Arrays.sort(expected);
-    passed = Arrays.equals(actual, expected);
-}
-System.out.println("OUT:" + "{\\\"k\\\":" + k + ",\\\"elements\\\":" + Arrays.toString(Arrays.copyOf(nums, k)) + "}");
-System.out.println("CR:" + passed);
-`;
-      }
-      break;
-    default:
-      throw new Error(`Unsupported Java judge kind: ${kind}`);
+function buildSource(language, signature, implementation, test, kind) {
+  if (language === "python") {
+    return pythonSource(signature, implementation, test, kind);
   }
 
-  return `
-import java.util.*;
-class Solution {
-    ${helpersBefore}${signature} {
-${body}
-    }${helpersAfter}
-}
-public class Main {
-    public static void main(String[] args) {
-        Solution solution = new Solution();
-${invocation.split("\n").map((x) => x ? `        ${x}` : "").join("\n")}
-    }
-}
-`.trim();
-}
+  if (language === "c") {
+    return cSource(signature, implementation, test, kind);
+  }
 
-function buildSource(language: Language, signature: string, implementation: string, test: TestCase, kind: string) {
-  if (language === "python") return pythonSource(signature, implementation, test, kind);
-  if (language === "c") return cSource(signature, implementation, test, kind);
   throw new Error(`Unsupported programming language: ${language}`);
 }
 
-function normalizeOutput(value: string | null | undefined) {
-  return (value ?? "").trim();
+function decodeBase64Utf8(value) {
+  if (!value) return value ?? null;
+
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return value;
+  }
 }
 
-function passed(result: JudgeResult) {
+function decodeJudgeResult(result) {
+  return {
+    ...result,
+    stdout: decodeBase64Utf8(result.stdout),
+    stderr: decodeBase64Utf8(result.stderr),
+    compile_output: decodeBase64Utf8(result.compile_output),
+    message: decodeBase64Utf8(result.message),
+  };
+}
+
+async function submit(judgeUrl, auth, languageId, source) {
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (auth) {
+    headers["X-Auth-Token"] = auth;
+  }
+
+  const sourceBytes = new TextEncoder().encode(String(source ?? ""));
+  let binarySource = "";
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < sourceBytes.length; i += chunkSize) {
+    binarySource += String.fromCharCode(
+      ...sourceBytes.subarray(i, i + chunkSize),
+    );
+  }
+
+  const encodedSource = btoa(binarySource);
+
+  const response = await fetch(
+    `${judgeUrl.replace(/\/$/, "")}/submissions?base64_encoded=true&wait=true`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        language_id: languageId,
+        source_code: encodedSource,
+        cpu_time_limit: 2,
+        wall_time_limit: 5,
+        memory_limit: 128000,
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Judge returned HTTP ${response.status}: ${await response.text()}`,
+    );
+  }
+
+  return decodeJudgeResult(await response.json());
+}
+
+function normalizeOutput(value) {
+  return String(value ?? "").trim();
+}
+
+function passed(result) {
   return (
-    result.status?.id === 3 &&
+    result?.status?.id === 3 &&
     /(^|\n)CR:True\s*$/m.test(normalizeOutput(result.stdout))
   );
 }
 
-function actualOutput(result: JudgeResult): string | null {
-  const stdout = result.stdout ?? "";
+function actualOutput(result) {
+  const stdout = String(result?.stdout ?? "");
   const match = stdout.match(/(?:^|\n)OUT:(.*)(?:\n|$)/);
   return match ? match[1].trim() : null;
 }
 
-function statusFor(result: JudgeResult) {
-  const id = result.status?.id;
+function statusFor(result) {
+  const id = result?.status?.id;
+
   if (id === 3) return "COMPLETED";
   if (id === 4 || id === 6) return "COMPILATION_ERROR";
   if (id === 5 || id === 9) return "TIME_LIMIT";
-  if (id === 7 || id === 8 || id === 11 || id === 12) return "RUNTIME_ERROR";
+  if (id === 7 || id === 8 || id === 11 || id === 12) {
+    return "RUNTIME_ERROR";
+  }
   if (id === 13 || id === 14) return "SYSTEM_ERROR";
+
   return "SYSTEM_ERROR";
 }
 
-async function submit(judgeUrl: string, auth: string | undefined, languageId: number, source: string) {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (auth) headers["X-Auth-Token"] = auth;
-
-  const response = await fetch(`${judgeUrl.replace(/\/$/, "")}/submissions?wait=true&base64_encoded=false`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      language_id: languageId,
-      source_code: source,
-      cpu_time_limit: 2,
-      wall_time_limit: 5,
-      memory_limit: 128000,
-    }),
-  });
-
-  if (!response.ok) throw new Error(`Judge returned HTTP ${response.status}: ${await response.text()}`);
-  return (await response.json()) as JudgeResult;
+function firstRow(value) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
 }
 
-export default async function (req: Request) {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (req.method !== "POST") return json({ error: "Only POST requests are supported" }, 405);
+function isTruthyRpc(value) {
+  if (value === true) return true;
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return false;
+    const first = value[0];
+
+    if (first === true) return true;
+    if (first && typeof first === "object") {
+      if (first.ok === true) return true;
+      if (first.result === true) return true;
+      if (first.coderelay_user_is_team_member === true) return true;
+      if (first.exists === true) return true;
+    }
+  }
+
+  if (value && typeof value === "object") {
+    if (value.ok === true) return true;
+    if (value.result === true) return true;
+    if (value.coderelay_user_is_team_member === true) return true;
+    if (value.exists === true) return true;
+  }
+
+  return false;
+}
+
+function queryValue(value) {
+  return encodeURIComponent(String(value));
+}
+
+export default async function handler(req) {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  if (req.method !== "POST") {
+    return json({ error: "Only POST requests are supported" }, 405);
+  }
 
   try {
-    const accessToken = token(req);
-    if (!accessToken) return json({ error: "Authentication required" }, 401);
+    const accessToken = getBearerToken(req);
 
-    const input = (await req.json()) as Partial<RunRequest>;
-    const { session_id, team_id, question_id, language, implementation, final_submission = false } = input;
+    if (!accessToken) {
+      return json({ error: "Authentication required" }, 401);
+    }
 
-    if (!session_id || !team_id || !question_id || !language || typeof implementation !== "string") {
+    const input = await req.json();
+
+    const sessionId = input?.session_id;
+    const teamId = input?.team_id;
+    const questionId = input?.question_id;
+    const language = input?.language;
+    const implementation = input?.implementation;
+    const finalSubmission = input?.final_submission === true;
+
+    if (
+      !sessionId ||
+      !teamId ||
+      !questionId ||
+      !language ||
+      typeof implementation !== "string"
+    ) {
       return json({ error: "Missing required fields" }, 400);
     }
 
-    if (!["c", "python"].includes(language)) {
+    if (language !== "c" && language !== "python") {
       return json({ error: "Unsupported programming language" }, 400);
     }
 
-    const insforgeUrl = Deno.env.get("INSFORGE_URL");
+    const insforgeUrl = requiredEnv("INSFORGE_URL");
     const judgeUrl = Deno.env.get("JUDGE0_URL");
-    const judgeAuth = Deno.env.get("JUDGE0_AUTH_TOKEN");
 
-    if (!insforgeUrl) throw new Error("INSFORGE_URL is not configured");
-    if (!judgeUrl) return json({ error: "Secure judge is not configured", code: "JUDGE_NOT_CONFIGURED" }, 503);
-
-    const db = createClient({ baseUrl: insforgeUrl, accessToken });
-
-    const currentUser = await db.auth.getCurrentUser();
-    if (currentUser.error || !currentUser.data?.user) return json({ error: "Invalid authentication" }, 401);
-    const userId = currentUser.data.user.id;
-
-    /*
-     * Resolve the team through a SECURITY DEFINER RPC instead of selecting
-     * directly from public.teams with the student's access token.
-     *
-     * The direct RLS-protected query previously returned no row for Student 3
-     * even though the team existed, producing the misleading:
-     *
-     *   Team not found
-     *
-     * In the single-laptop relay model the authenticated account is the team
-     * account, so get_round2_team_for_creator() is the authoritative lookup.
-     */
-    const teamResult = await db.database.rpc(
-      "get_round2_team_for_creator",
-      { p_team_id: team_id },
-    );
-
-    if (teamResult.error) {
-      return json({
-        error: "Unable to resolve your Round 2 team",
-        details: teamResult.error,
-      }, 500);
+    if (!judgeUrl) {
+      return json(
+        {
+          error: "Secure judge is not configured",
+          code: "JUDGE_NOT_CONFIGURED",
+        },
+        503,
+      );
     }
 
-    const team = Array.isArray(teamResult.data)
-      ? teamResult.data[0]
-      : teamResult.data;
+    /*
+     * Creator-only identity:
+     * the authenticated account that created the approved team is the
+     * authenticated identity for the entire physical 3-student relay.
+     *
+     * This is deliberately NOT based on student_2_name/student_3_name.
+     */
+    let teamRows;
+
+    try {
+      teamRows = await dbRpc(
+        insforgeUrl,
+        accessToken,
+        "get_round2_team_for_creator",
+        { p_team_id: teamId },
+      );
+    } catch (error) {
+      if (error?.status === 404) {
+        return json({ error: "Team not found" }, 404);
+      }
+      throw error;
+    }
+
+    const team = firstRow(teamRows);
 
     if (!team) {
-      return json({ error: "Team not found" }, 404);
+      return json(
+        {
+          error:
+            "Team not found for this authenticated creator. Make sure you are signed in with the account that created the team.",
+        },
+        404,
+      );
     }
 
     if (team.status !== "APPROVED") {
-      return json({
-        error: "This team is not approved for Round 2",
-      }, 403);
+      return json(
+        { error: "This team is not approved for Round 2" },
+        403,
+      );
     }
 
     /*
-     * Round 2 is a three-student relay. Any authenticated team member may
-     * execute code. Final submission is restricted to Student 3 and is
-     * therefore the only action that creates/updates the official marks row.
+     * Defense-in-depth membership check. The SQL function should also be
+     * creator-only after the Round 2 identity migration.
      */
-    const memberCheck = await db.database.rpc("coderelay_user_is_team_member", {
-      p_team_id: team_id,
-    });
+    const memberCheck = await dbRpc(
+      insforgeUrl,
+      accessToken,
+      "coderelay_user_is_team_member",
+      { p_team_id: teamId },
+    );
 
-    if (memberCheck.error) {
-      return json({
-        error: "Unable to verify team membership",
-        details: memberCheck.error,
-      }, 500);
+    if (!isTruthyRpc(memberCheck)) {
+      return json(
+        {
+          error: "You are not a member of this approved team",
+        },
+        403,
+      );
     }
 
-    const isTeamMember =
-      memberCheck.data === true ||
-      (Array.isArray(memberCheck.data) && memberCheck.data[0] === true);
+    const sessionRows = await dbRecords(
+      insforgeUrl,
+      accessToken,
+      "round2_sessions",
+      [
+        `id=eq.${queryValue(sessionId)}`,
+        "select=id,phase,coding_stage",
+        "limit=1",
+      ].join("&"),
+    );
 
-    if (!isTeamMember) {
-      return json({ error: "You are not authorized for this team" }, 403);
-    }
-
-    const session = await loadCodingSession(db, session_id);
+    const session = firstRow(sessionRows);
 
     if (!session) {
       return json({ error: "Round 2 session not found" }, 404);
     }
 
     if (session.phase !== "CODING") {
-      return json({ error: "Code can only be executed during the coding phase" }, 409);
+      return json(
+        {
+          error:
+            "Code can only be executed during the coding phase",
+        },
+        409,
+      );
     }
 
-    if (session.coding_stage !== "STUDENT_3") {
-      return json({ error: "Only Student 3 can run Round 2 code" }, 409);
+    if (
+      finalSubmission &&
+      session.coding_stage !== "STUDENT_3"
+    ) {
+      return json(
+        {
+          error:
+            "Only Student 3 can make the final Round 2 submission",
+        },
+        409,
+      );
     }
 
-    if (isCodingTimeExpired(session)) {
-      return json({ error: "Round 2 coding time has expired" }, 409);
-    }
+    /*
+     * The question is resolved from the team number using the existing
+     * database RPC. This prevents a client from selecting another team's
+     * question by sending a different question_id.
+     */
+    const expectedQuestion = await dbRpc(
+      insforgeUrl,
+      accessToken,
+      "get_round2_question_for_team",
+      { p_team_id: teamId },
+    );
 
-    if (final_submission && session.coding_stage !== "STUDENT_3") {
-      return json({
-        error: "Only Student 3 can make the final Round 2 submission",
-      }, 409);
-    }
+    const resolved = firstRow(expectedQuestion);
 
-    /* Team number determines the question. Do NOT compare against the global session.question_id. */
-    const expectedQuestion = await db.database.rpc("get_round2_question_for_team", { p_team_id: team_id });
-    if (expectedQuestion.error) return json({ error: "Unable to resolve the team's question", details: expectedQuestion.error }, 500);
-
-    const resolved = (expectedQuestion.data as Array<{ question_id: string; function_signature_c: string | null; function_signature_python: string | null; function_signature_java: string | null; interface_status: string }>)?.[0];
-
-    if (!resolved || resolved.question_id !== question_id) {
-      return json({ error: "Question does not belong to this team" }, 400);
+    if (!resolved || resolved.question_id !== questionId) {
+      return json(
+        { error: "Question does not belong to this team" },
+        400,
+      );
     }
 
     if (resolved.interface_status !== "APPROVED") {
-      return json({ error: "Question interface is not approved" }, 409);
+      return json(
+        { error: "Question interface is not approved" },
+        409,
+      );
     }
 
     const signature =
@@ -792,55 +995,70 @@ export default async function (req: Request) {
         ? resolved.function_signature_c
         : resolved.function_signature_python;
 
-    if (!signature?.trim()) return json({ error: "Official function signature is missing" }, 409);
-
-    const configResult = await db.database.rpc("get_round2_judge_config", { p_question_id: question_id });
-    if (configResult.error || !configResult.data?.[0]) {
-      return json({ error: "Judge configuration is missing", details: configResult.error ?? null }, 409);
+    if (!signature || !String(signature).trim()) {
+      return json(
+        { error: "Official function signature is missing" },
+        409,
+      );
     }
 
-    const configRow = configResult.data[0] as { judge_config?: { kind?: string } };
-    const kind = configRow.judge_config?.kind;
-    if (!kind) return json({ error: "Judge configuration kind is missing" }, 409);
+    const configResult = await dbRpc(
+      insforgeUrl,
+      accessToken,
+      "get_round2_judge_config",
+      { p_question_id: questionId },
+    );
+
+    const configRow = firstRow(configResult);
+    const judgeConfig =
+      configRow?.judge_config ??
+      configRow?.config ??
+      configRow ??
+      null;
+
+    const kind = judgeConfig?.kind;
+
+    if (!kind) {
+      return json(
+        { error: "Judge configuration kind is missing" },
+        409,
+      );
+    }
 
     /*
-     * Hidden tests must never be fetched with the student's access token.
-     * Use a server-only InsForge service key so RLS cannot expose hidden
-     * cases to the browser. The service key is an Edge Function secret.
+     * Hidden tests are fetched only with the server-side API key.
+     * The student's JWT is never used to retrieve the hidden test suite.
      */
-    const serviceKey =
-      Deno.env.get("API_KEY") ??
-      Deno.env.get("INSFORGE_SERVICE_KEY") ??
-      Deno.env.get("INSFORGE_ADMIN_KEY");
+    const serviceKey = Deno.env.get("API_KEY");
 
     if (!serviceKey) {
-      return json({
-        error: "Server judge is not configured",
-        details: "API_KEY is missing",
-      }, 503);
+      return json(
+        {
+          error: "Server judge is not configured",
+          details: "API_KEY is missing",
+        },
+        503,
+      );
     }
 
-    const judgeDb = createClient({
-      baseUrl: insforgeUrl,
-      accessToken: serviceKey,
-    });
+    const testsRows = await dbRecords(
+      insforgeUrl,
+      serviceKey,
+      "round2_test_cases",
+      [
+        `question_id=eq.${queryValue(questionId)}`,
+        "select=id,input_data,expected_output,is_hidden,created_at",
+        "order=created_at.asc",
+      ].join("&"),
+    );
 
-    const testsResult = await judgeDb.database
-      .from("round2_test_cases")
-      .select("id, input_data, expected_output, is_hidden, created_at")
-      .eq("question_id", question_id)
-      .order("created_at", { ascending: true });
+    const tests = Array.isArray(testsRows) ? testsRows : [];
 
-    if (testsResult.error) {
-      return json({
-        error: "Unable to load judge tests",
-        details: testsResult.error,
-      }, 500);
-    }
-
-    const tests = (testsResult.data as TestCase[]) ?? [];
-    if (!tests.length) {
-      return json({ error: "No judge tests are configured" }, 409);
+    if (tests.length === 0) {
+      return json(
+        { error: "No judge tests are configured" },
+        409,
+      );
     }
 
     const visibleTests = tests
@@ -848,32 +1066,35 @@ export default async function (req: Request) {
       .slice(0, 2);
 
     const cleanImplementation = bodyOf(implementation);
+
     let passedTests = 0;
-    let last: JudgeResult | null = null;
-    const visibleCases: Array<{
-      case_number: number;
-      input_data: unknown;
-      output: unknown;
-      expected_output: unknown;
-      passed: boolean;
-    }> = [];
+    let last = null;
+
+    const visibleCases = [];
     const started = Date.now();
 
+    /*
+     * Every configured case is executed.
+     * The browser receives ONLY the first two visible cases.
+     */
     for (let index = 0; index < tests.length; index++) {
       const test = tests[index];
+
       const source = buildSource(
         language,
-        signature.trim(),
+        String(signature).trim(),
         cleanImplementation,
         test,
         kind,
       );
+
       const result = await submit(
         judgeUrl,
-        judgeAuth,
+        Deno.env.get("JUDGE0_AUTH_TOKEN"),
         LANGUAGE_IDS[language],
         source,
       );
+
       last = result;
 
       const casePassed = passed(result);
@@ -882,10 +1103,6 @@ export default async function (req: Request) {
         passedTests++;
       }
 
-      /*
-       * Only the two visible cases are included in the response.
-       * Hidden cases are judged here but never serialized to the client.
-       */
       const visibleIndex = visibleTests.findIndex(
         (visible) => visible.id === test.id,
       );
@@ -894,133 +1111,123 @@ export default async function (req: Request) {
         visibleCases.push({
           case_number: visibleIndex + 1,
           input_data: test.input_data,
-          output: actualOutput(result) ?? result.stdout?.trim() ?? "",
+          output:
+            actualOutput(result) ??
+            String(result.stdout ?? "").trim(),
           expected_output: test.expected_output,
           passed: casePassed,
         });
       }
-
-      /*
-       * Do not break on a wrong answer or runtime failure. Every configured
-       * judge case is executed so passed_tests/total_tests represent the
-       * complete question test suite.
-       */
     }
 
     const finalStatus =
       last?.status?.id === 3
-        ? (passedTests === tests.length ? "COMPLETED" : "WRONG_ANSWER")
-        : statusFor(last ?? {});
+        ? passedTests === tests.length
+          ? "COMPLETED"
+          : "WRONG_ANSWER"
+        : statusFor(last);
 
     const executionTime = Date.now() - started;
 
-    const sessionBeforeSave = await loadCodingSession(db, session_id);
-    if (
-      !sessionBeforeSave ||
-      sessionBeforeSave.phase !== "CODING" ||
-      sessionBeforeSave.coding_stage !== "STUDENT_3" ||
-      isCodingTimeExpired(sessionBeforeSave)
-    ) {
-      return json({ error: "Round 2 coding time has expired" }, 409);
+    /*
+     * Save the run using the student's JWT so the existing database RPC/RLS
+     * continues to enforce team/session/question ownership.
+     */
+    const saved = await dbRpc(
+      insforgeUrl,
+      accessToken,
+      "save_round2_code_run",
+      {
+        p_session_id: sessionId,
+        p_team_id: teamId,
+        p_question_id: questionId,
+        p_language: language,
+        p_source_code: "Server-generated judge source",
+        p_status: finalStatus,
+        p_passed_tests: passedTests,
+        p_total_tests: tests.length,
+        p_execution_time_ms: executionTime,
+        p_memory_kb: last?.memory ?? null,
+        p_compiler_output: last?.compile_output ?? null,
+        p_runtime_output: last?.stdout ?? null,
+        p_error_message:
+          last?.stderr ??
+          last?.message ??
+          null,
+      },
+    );
+
+    const savedRow = firstRow(saved);
+
+    if (!savedRow && saved == null) {
+      return json(
+        {
+          error:
+            "Execution succeeded, but the run could not be stored",
+          status: finalStatus,
+          visible_cases: visibleCases,
+        },
+        500,
+      );
     }
 
     /*
-     * Save through the existing RPC. This avoids exposing a direct student insert path.
-     * The RPC must accept the status string WRONG_ANSWER; if the DB constraint does not,
-     * add that status to round2_code_runs.
+     * Official 30-point result:
+     * ONLY Student 3 final submission creates/updates this record.
+     * Score is calculated from ALL configured visible + hidden cases.
      */
-    const saved = await db.database.rpc("save_round2_code_run", {
-      p_session_id: session_id,
-      p_team_id: team_id,
-      p_question_id: question_id,
-      p_language: language,
-      p_source_code: "Server-generated judge source",
-      p_status: finalStatus,
-      p_passed_tests: passedTests,
-      p_total_tests: tests.length,
-      p_execution_time_ms: executionTime,
-      p_memory_kb: last?.memory ?? null,
-      p_compiler_output: last?.compile_output ?? null,
-      p_runtime_output: last?.stdout ?? null,
-      p_error_message: last?.stderr ?? last?.message ?? null,
-    });
+    let finalResultId = null;
 
-    if (saved.error) {
-      if (/coding time has expired|not in an active coding stage/i.test(saved.error.message ?? "")) {
-        return json({ error: saved.error.message }, 409);
-      }
-
-      return json({
-        run_id: null,
-        status: finalStatus,
-        execution_time_ms: executionTime,
-        compiler_output: last?.compile_output ?? null,
-        runtime_output: last?.stdout ?? null,
-        error_message: saved.error.message ?? "Execution result could not be stored",
-        visible_cases: visibleCases,
-        storage_error: saved.error,
-      });
-    }
-
-    const row = Array.isArray(saved.data) ? saved.data[0] : saved.data;
-
-    /*
-     * Official marks are created ONLY for the final Student 3 submission.
-     * The score never goes back to the student response.
-     *
-     * 30 marks are distributed equally across every configured visible and
-     * hidden test case.
-     */
-    let finalResultId: string | null = null;
-    let finalResultSummary: {
-      total_cases: number;
-      passed_cases: number;
-      failed_cases: number;
-      visible_cases: number;
-      hidden_cases: number;
-      score: number;
-      max_score: number;
-      status: "SOLVED" | "ATTEMPTED";
-    } | null = null;
-
-    if (final_submission) {
-      const sessionBeforeFinalResult = await loadCodingSession(db, session_id);
-      if (
-        !sessionBeforeFinalResult ||
-        sessionBeforeFinalResult.phase !== "CODING" ||
-        sessionBeforeFinalResult.coding_stage !== "STUDENT_3" ||
-        isCodingTimeExpired(sessionBeforeFinalResult)
-      ) {
-        return json({ error: "Round 2 coding time has expired" }, 409);
-      }
-
+    if (finalSubmission) {
       const totalCases = tests.length;
       const passedCases = passedTests;
       const failedCases = totalCases - passedCases;
-      const visibleCaseCount = tests.filter((test) => !test.is_hidden).length;
-      const hiddenCaseCount = tests.filter((test) => test.is_hidden).length;
-      const score = Number(((passedCases / totalCases) * 30).toFixed(2));
+
+      const visibleCaseCount = tests.filter(
+        (test) => !test.is_hidden,
+      ).length;
+
+      const hiddenCaseCount = tests.filter(
+        (test) => test.is_hidden,
+      ).length;
+
+      const score =
+        totalCases > 0
+          ? Number(((passedCases / totalCases) * 30).toFixed(2))
+          : 0;
+
       const officialStatus =
-        passedCases === totalCases ? "SOLVED" : "ATTEMPTED";
+        passedCases === totalCases
+          ? "SOLVED"
+          : "ATTEMPTED";
 
-      const existingResult = await judgeDb.database
-        .from("round2_final_results")
-        .select("id")
-        .eq("team_id", team_id)
-        .eq("question_id", question_id)
-        .maybeSingle();
+      /*
+       * submitted_by uses the approved team's creator ID.
+       * Under the single-account relay model this is the authenticated
+       * account for the whole team.
+       */
+      const submittedBy = team.created_by;
 
-      if (existingResult.error) {
-        return json({
-          error: "Unable to check existing Round 2 final result",
-          details: existingResult.error,
-        }, 500);
-      }
+      // A team can receive different questions across event runs.
+      // The official result is therefore unique by TEAM + QUESTION, not team alone.
+      const existingRows = await dbRecords(
+        insforgeUrl,
+        serviceKey,
+        "round2_final_results",
+        [
+          `team_id=eq.${queryValue(teamId)}`,
+          `question_id=eq.${queryValue(questionId)}`,
+          "select=id",
+          "limit=1",
+        ].join("&"),
+      );
+
+      const existingResult = firstRow(existingRows);
 
       const resultPayload = {
-        team_id,
-        question_id,
-        submitted_by: userId,
+        team_id: teamId,
+        question_id: questionId,
+        submitted_by: submittedBy,
         language,
         total_cases: totalCases,
         passed_cases: passedCases,
@@ -1033,63 +1240,95 @@ export default async function (req: Request) {
         submitted_at: new Date().toISOString(),
       };
 
-      const finalResult = existingResult.data?.id
-        ? await judgeDb.database
-            .from("round2_final_results")
-            .update(resultPayload)
-            .eq("id", existingResult.data.id)
-            .select("id")
-            .maybeSingle()
-        : await judgeDb.database
-            .from("round2_final_results")
-            .insert(resultPayload)
-            .select("id")
-            .maybeSingle();
+      let finalResult;
 
-      if (finalResult.error) {
-        return json({
-          error: "Code execution succeeded, but the final marks could not be saved",
-          details: finalResult.error,
-        }, 500);
+      if (existingResult?.id) {
+        finalResult = await dbUpdate(
+          insforgeUrl,
+          serviceKey,
+          "round2_final_results",
+          `id=eq.${queryValue(existingResult.id)}`,
+          resultPayload,
+        );
+      } else {
+        finalResult = await dbInsert(
+          insforgeUrl,
+          serviceKey,
+          "round2_final_results",
+          [resultPayload],
+        );
       }
 
-      finalResultId = finalResult.data?.id ?? null;
-      finalResultSummary = {
-        total_cases: totalCases,
-        passed_cases: passedCases,
-        failed_cases: failedCases,
-        visible_cases: visibleCaseCount,
-        hidden_cases: hiddenCaseCount,
-        score,
-        max_score: 30,
-        status: officialStatus,
-      };
+      const finalRow = firstRow(finalResult);
+      finalResultId = finalRow?.id ?? null;
+
+      // Never tell the student that marks were submitted unless the
+      // round2_final_results row was actually persisted.
+      if (!finalResultId) {
+        throw new Error(
+          "Final submission was judged, but the marks could not be stored in round2_final_results",
+        );
+      }
+
+      // Verify the persisted record using the server API key. This catches
+      // cases where an InsForge insert/update response is empty or malformed.
+      const verifiedRows = await dbRecords(
+        insforgeUrl,
+        serviceKey,
+        "round2_final_results",
+        [
+          `id=eq.${queryValue(finalResultId)}`,
+          `team_id=eq.${queryValue(teamId)}`,
+          `question_id=eq.${queryValue(questionId)}`,
+          "select=id,team_id,question_id,passed_cases,failed_cases,total_cases,score,max_score,status,submitted_at",
+          "limit=1",
+        ].join("&"),
+      );
+
+      const verifiedResult = firstRow(verifiedRows);
+
+      if (!verifiedResult) {
+        throw new Error(
+          "Final submission was judged, but InsForge could not verify the saved marks record",
+        );
+      }
+
+      finalResultId = verifiedResult.id;
     }
 
     /*
-     * Do not return passed_tests or total_tests. The student must not receive
-     * the official marks or enough information to calculate them.
+     * Do NOT return passed_tests/total_tests/score to the browser.
+     * The browser gets visible-case information only.
      */
     return json({
-      run_id: (row as { id?: string } | null)?.id ?? null,
+      run_id: savedRow?.id ?? null,
       status: finalStatus,
       execution_time_ms: executionTime,
       compiler_output: last?.compile_output ?? null,
       runtime_output: last?.stdout ?? null,
-      error_message: last?.stderr ?? last?.message ?? null,
+      error_message:
+        last?.stderr ??
+        last?.message ??
+        null,
       visible_cases: visibleCases,
-      ...(final_submission
+      ...(finalSubmission
         ? {
             final_submission: true,
-            final_result_saved: Boolean(finalResultId),
-            final_result: finalResultSummary,
+            final_result_saved: true,
           }
         : {}),
     });
   } catch (error) {
     console.error("run-round2-code failed:", error);
-    return json({
-      error: error instanceof Error ? error.message : "Internal server error",
-    }, 500);
+
+    return json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Internal server error",
+      },
+      500,
+    );
   }
 }
