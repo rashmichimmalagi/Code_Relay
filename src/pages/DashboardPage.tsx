@@ -59,6 +59,7 @@ type Round2Session = {
   phase_extension_seconds: number;
   question_extension_seconds?: number;
   coding_extension_seconds?: number;
+  student3_extension_seconds?: number;
   coding_stage?: "STUDENT_2" | "STUDENT_3";
   phase: Round2Phase;
   phase_started_at: string | null;
@@ -132,16 +133,8 @@ type TeamCode = {
 
 type CodeRunResult = {
   status: string;
-  final_result?: {
-    total_cases: number;
-    passed_cases: number;
-    failed_cases: number;
-    visible_cases: number;
-    hidden_cases: number;
-    score: number;
-    max_score: number;
-    status: "SOLVED" | "ATTEMPTED";
-  };
+  final_submission?: boolean;
+  final_result_saved?: boolean;
   visible_cases?: Array<{
     case_number: number;
     input_data: unknown;
@@ -154,7 +147,7 @@ type CodeRunResult = {
 type SubmissionSnapshot = {
   code: string;
   language: ProgrammingLanguage;
-  status: "SOLVED" | "ATTEMPTED";
+  status: string;
   submitted_at: string;
   score?: number;
   max_score?: number;
@@ -162,8 +155,6 @@ type SubmissionSnapshot = {
   total_cases?: number;
   failed_cases?: number;
 };
-
-type FinalSubmissionResult = NonNullable<CodeRunResult["final_result"]>;
 
 function ActionIcon({
   name,
@@ -1444,9 +1435,6 @@ export function DashboardPage() {
   const [isRunningCode, setIsRunningCode] = useState(false);
   const [codeRunResult, setCodeRunResult] =
     useState<CodeRunResult | null>(null);
-  const [finalSubmissionResult, setFinalSubmissionResult] =
-    useState<FinalSubmissionResult | null>(null);
-
   const [selectedResultCase, setSelectedResultCase] =
     useState(1);
 
@@ -1742,7 +1730,7 @@ export function DashboardPage() {
 
       const parsed = JSON.parse(raw) as Partial<SubmissionSnapshot>;
       if (
-        (parsed.status === "SOLVED" || parsed.status === "ATTEMPTED") &&
+        (parsed.status === "SOLVED" || parsed.status === "ATTEMPTED" || parsed.status === "SUBMITTED") &&
         typeof parsed.code === "string" &&
         (parsed.language === "c" ||
           parsed.language === "python")
@@ -1904,21 +1892,15 @@ export function DashboardPage() {
         round2Session.phase === "QUESTION"
           ? Number(round2Session.question_duration_seconds)
           : codingStage === "STUDENT_3"
-            ? Number(round2Session.student3_duration_seconds ?? 900)
+            ? Number(round2Session.student3_duration_seconds)
             : Number(round2Session.coding_duration_seconds);
 
       const extension =
         round2Session.phase === "QUESTION"
-          ? Number(
-              round2Session.question_extension_seconds ??
-                round2Session.phase_extension_seconds ??
-                0,
-            )
-          : Number(
-              round2Session.coding_extension_seconds ??
-                round2Session.phase_extension_seconds ??
-                0,
-            );
+          ? Number(round2Session.question_extension_seconds ?? 0)
+          : codingStage === "STUDENT_3"
+            ? Number(round2Session.student3_extension_seconds ?? 0)
+            : Number(round2Session.coding_extension_seconds ?? 0);
 
       const total = base + extension;
       let nextRemaining = Number.isFinite(start) && Number.isFinite(total)
@@ -1952,6 +1934,7 @@ export function DashboardPage() {
     round2Session?.coding_stage,
     round2Session?.question_extension_seconds,
     round2Session?.coding_extension_seconds,
+    round2Session?.student3_extension_seconds,
     round2Session?.phase_extension_seconds,
   ]);
 
@@ -2076,7 +2059,6 @@ export function DashboardPage() {
     setCodeSaveMessage(null);
     setCodeError(null);
     setCodeRunResult(null);
-    setFinalSubmissionResult(null);
   }, [codingTimeExpired]);
 
   const handleLanguageChange = (
@@ -2097,7 +2079,6 @@ export function DashboardPage() {
     setCodeSaveMessage(null);
     setCodeError(null);
     setCodeRunResult(null);
-    setFinalSubmissionResult(null);
   };
 
   const handleClearCode = () => {
@@ -2110,7 +2091,6 @@ export function DashboardPage() {
     setCodeSaveMessage("Editor cleared");
     setCodeError(null);
     setCodeRunResult(null);
-    setFinalSubmissionResult(null);
     setSelectedResultCase(1);
   };
 
@@ -2137,7 +2117,7 @@ export function DashboardPage() {
         if (raw) {
           const parsed = JSON.parse(raw) as Partial<SubmissionSnapshot>;
           if (
-            (parsed.status === "SOLVED" || parsed.status === "ATTEMPTED") &&
+            (parsed.status === "SOLVED" || parsed.status === "ATTEMPTED" || parsed.status === "SUBMITTED") &&
             typeof parsed.code === "string" &&
             (parsed.language === "c" || parsed.language === "python")
           ) {
@@ -2170,7 +2150,6 @@ export function DashboardPage() {
     setCodeSaveMessage("Restored last submitted code");
     setCodeError(null);
     setCodeRunResult(null);
-    setFinalSubmissionResult(null);
     setSelectedResultCase(1);
   };
 
@@ -2238,28 +2217,26 @@ export function DashboardPage() {
       }
 
       const finalRun = result.data as CodeRunResult;
-      if (!finalRun.final_result) {
-        throw new Error("The server did not return the official final result.");
+
+      // The server intentionally does NOT return marks to Student 3.
+      // It only returns a persistence confirmation after the official
+      // result has been stored and verified in round2_final_results.
+      if (
+        finalRun.final_submission !== true ||
+        finalRun.final_result_saved !== true
+      ) {
+        throw new Error(
+          "Submission was judged, but the marks were not confirmed as saved by the server.",
+        );
       }
 
-      setCodeRunResult({
-        status: finalRun.status,
-        visible_cases: finalRun.visible_cases?.slice(0, 2),
-      });
-
-      const status = finalRun.final_result.status;
-      setFinalSubmissionResult(finalRun.final_result);
+      setCodeRunResult(null);
 
       const snapshot: SubmissionSnapshot = {
         code: codeRef.current,
         language,
-        status,
+        status: "SUBMITTED",
         submitted_at: new Date().toISOString(),
-        score: finalRun.final_result.score,
-        max_score: finalRun.final_result.max_score,
-        passed_cases: finalRun.final_result.passed_cases,
-        total_cases: finalRun.final_result.total_cases,
-        failed_cases: finalRun.final_result.failed_cases,
       };
 
       if (submissionStorageKey) {
@@ -2272,9 +2249,7 @@ export function DashboardPage() {
       setSubmittedSnapshot(snapshot);
       setSubmissionDirty(false);
       setCodeSaveMessage(
-        status === "SOLVED"
-          ? "Submission received successfully."
-          : "Submission received successfully.",
+        "Submission received successfully. Your code and marks have been submitted to the admin.",
       );
       setCodeError(null);
     } catch (err) {
@@ -2665,27 +2640,12 @@ export function DashboardPage() {
               })}
             </section>
 
-            {currentSubmissionIsActive && finalSubmissionResult && (
+            {currentSubmissionIsActive && (
               <div className="border-t border-white/10 bg-black/10 px-4 py-3" role="status">
-                <p className={`text-sm font-semibold ${
-                  finalSubmissionResult.status === "SOLVED"
-                    ? "text-emerald-300"
-                    : "text-amber-300"
-                }`}>
-                  {finalSubmissionResult.status}
+                <p className="text-sm font-semibold text-emerald-300">
+                  <span className="block">Submission received successfully.</span>
+                  <span className="block">Your code and marks have been submitted to the admin.</span>
                 </p>
-                {typeof finalSubmissionResult.score === "number" && (
-                  <p className="mt-1 text-sm text-slate-300">
-                    Score: {finalSubmissionResult.score} / {finalSubmissionResult.max_score}
-                  </p>
-                )}
-                {typeof finalSubmissionResult.passed_cases === "number" &&
-                  typeof finalSubmissionResult.total_cases === "number" && (
-                    <p className="mt-1 text-xs text-slate-400">
-                      Passed: {finalSubmissionResult.passed_cases} / {finalSubmissionResult.total_cases}
-                      · Failed: {finalSubmissionResult.failed_cases}
-                    </p>
-                  )}
               </div>
             )}
 

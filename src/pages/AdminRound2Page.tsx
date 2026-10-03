@@ -62,6 +62,7 @@ type Round2Session = {
    */
   question_extension_seconds: number;
   coding_extension_seconds: number;
+  student3_extension_seconds: number;
   coding_stage?: "STUDENT_2" | "STUDENT_3";
 
   /*
@@ -355,7 +356,7 @@ export default function AdminRound2Page() {
             Math.max(
               1,
               Math.round(
-                Number(current.student3_duration_seconds ?? 900) /
+                Number(current.student3_duration_seconds) /
                   60,
               ),
             ),
@@ -569,19 +570,15 @@ export default function AdminRound2Page() {
         session.phase === "QUESTION"
           ? session.question_duration_seconds
           : codingStage === "STUDENT_3"
-            ? Number(session.student3_duration_seconds ?? 900)
+            ? Number(session.student3_duration_seconds)
             : session.coding_duration_seconds;
 
       const extensionDuration =
         session.phase === "QUESTION"
-          ? Number(
-              session.question_extension_seconds ??
-                0,
-            )
-          : Number(
-              session.coding_extension_seconds ??
-                0,
-            );
+          ? Number(session.question_extension_seconds ?? 0)
+          : codingStage === "STUDENT_3"
+            ? Number(session.student3_extension_seconds ?? 0)
+            : Number(session.coding_extension_seconds ?? 0);
 
       const totalDuration =
         Number(baseDuration) +
@@ -1207,6 +1204,7 @@ export default function AdminRound2Page() {
         question_extension_seconds: 0,
 
         coding_extension_seconds: 0,
+        student3_extension_seconds: 0,
         coding_stage: "STUDENT_2",
 
         /*
@@ -1523,6 +1521,7 @@ export default function AdminRound2Page() {
           coding_stage: "STUDENT_3",
           phase_started_at: new Date().toISOString(),
           coding_extension_seconds: 0,
+          student3_extension_seconds: 0,
           question_extension_seconds: 0,
           phase_extension_seconds: 0,
         })
@@ -1672,65 +1671,55 @@ export default function AdminRound2Page() {
     setMessage(null);
 
     try {
-      const addedSeconds =
-        minutes * 60;
+      const addedSeconds = minutes * 60;
+      const stage = session.coding_stage ?? "STUDENT_2";
 
       const currentExtension =
-        Number(
-          session.coding_extension_seconds ??
-            0,
-        );
+        stage === "STUDENT_3"
+          ? Number(session.student3_extension_seconds ?? 0)
+          : Number(session.coding_extension_seconds ?? 0);
 
-      const result =
-        await insforge.database
-          .from("round2_sessions")
-          .update({
-            coding_extension_seconds:
-              currentExtension +
-              addedSeconds,
+      const updatePayload =
+        stage === "STUDENT_3"
+          ? {
+              student3_extension_seconds:
+                currentExtension + addedSeconds,
+              phase_extension_seconds:
+                currentExtension + addedSeconds,
+            }
+          : {
+              coding_extension_seconds:
+                currentExtension + addedSeconds,
+              phase_extension_seconds:
+                currentExtension + addedSeconds,
+            };
 
-            /*
-             * Keep legacy field synchronized
-             * for compatibility.
-             */
-            phase_extension_seconds:
-              currentExtension +
-              addedSeconds,
-          })
-          .eq(
-            "id",
-            session.id,
-          )
-          .eq(
-            "phase",
-            "CODING",
-          )
-          .select()
-          .maybeSingle();
+      const result = await insforge.database
+        .from("round2_sessions")
+        .update(updatePayload)
+        .eq("id", session.id)
+        .eq("phase", "CODING")
+        .eq("coding_stage", stage)
+        .select()
+        .maybeSingle();
 
       if (result.error) {
         throw result.error;
       }
 
       if (!result.data) {
-        throw new Error(
-          "Coding time extension was not saved.",
-        );
+        throw new Error("Coding time extension was not saved.");
       }
 
       setMessage(
-        `Added ${minutes} minute${
-          minutes === 1 ? "" : "s"
-        } to Student 2's coding time.`,
+        `Added ${minutes} minute${minutes === 1 ? "" : "s"} to ${
+          stage === "STUDENT_3" ? "Student 3" : "Student 2"
+        }'s coding time.`,
       );
 
       await loadSession();
     } catch (err) {
-      console.error(
-        "Unable to extend coding time:",
-        err,
-      );
-
+      console.error("Unable to extend coding time:", err);
       setError(
         err instanceof Error
           ? err.message
@@ -1779,6 +1768,9 @@ export default function AdminRound2Page() {
           .update({
             phase: "ENDED",
             phase_started_at: null,
+            question_extension_seconds: 0,
+            coding_extension_seconds: 0,
+            student3_extension_seconds: 0,
             phase_extension_seconds: 0,
           })
           .eq(
@@ -1896,10 +1888,11 @@ export default function AdminRound2Page() {
           session.coding_duration_seconds,
         ),
         student3_duration_seconds: Number(
-          session.student3_duration_seconds ?? 900,
+          session.student3_duration_seconds,
         ),
         question_extension_seconds: 0,
         coding_extension_seconds: 0,
+        student3_extension_seconds: 0,
         coding_stage: "STUDENT_2",
         phase_extension_seconds: 0,
         phase: "CONFIGURED",
@@ -2378,7 +2371,7 @@ export default function AdminRound2Page() {
                       {Math.floor(
                         Number(
                           (session.coding_stage ?? "STUDENT_2") === "STUDENT_3"
-                            ? (session.student3_duration_seconds ?? 900)
+                            ? session.student3_duration_seconds
                             : session.coding_duration_seconds,
                         ) / 60,
                       )}{" "}
@@ -2391,8 +2384,9 @@ export default function AdminRound2Page() {
                     <strong className="text-emerald-300">
                       {Math.floor(
                         Number(
-                          session.coding_extension_seconds ??
-                            0,
+                          (session.coding_stage ?? "STUDENT_2") === "STUDENT_3"
+                            ? (session.student3_extension_seconds ?? 0)
+                            : (session.coding_extension_seconds ?? 0),
                         ) / 60,
                       )}{" "}
                       min
