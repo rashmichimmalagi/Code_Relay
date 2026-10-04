@@ -40,12 +40,15 @@ const LANGUAGE_IDS = {
 
 const EDITOR_STORAGE_PREFIX = "__CODERELAY_EDITOR_V1__";
 
-function extractCleanCode(rawCode) {
+function cleanRound2Code(rawCode) {
   if (!rawCode || typeof rawCode !== "string") {
     return "";
   }
 
   const trimmed = rawCode.trim();
+  if (!trimmed) {
+    return "";
+  }
 
   if (trimmed.startsWith(EDITOR_STORAGE_PREFIX)) {
     try {
@@ -53,11 +56,25 @@ function extractCleanCode(rawCode) {
         trimmed.slice(EDITOR_STORAGE_PREFIX.length),
       );
 
-      if (typeof parsed?.body === "string") {
-        return parsed.body;
+      if (parsed && typeof parsed === "object") {
+        const before = typeof parsed.before === "string" ? parsed.before : "";
+        const body = typeof parsed.body === "string" ? parsed.body : "";
+        const after = typeof parsed.after === "string" ? parsed.after : "";
+
+        if (before.trim() || after.trim()) {
+          const parts = [];
+          if (before.trim()) parts.push(before);
+          if (body) parts.push(body);
+          if (after.trim()) parts.push(after);
+          return parts.join("\n\n");
+        }
+
+        if (typeof parsed.body === "string") {
+          return parsed.body;
+        }
       }
     } catch {
-      // JSON parsing failed, safely fall back without throwing errors
+      return rawCode;
     }
   }
 
@@ -65,16 +82,34 @@ function extractCleanCode(rawCode) {
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
       const parsed = JSON.parse(trimmed);
-      if (typeof parsed?.body === "string") {
-        return parsed.body;
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        typeof parsed.body === "string"
+      ) {
+        const before = typeof parsed.before === "string" ? parsed.before : "";
+        const body = parsed.body;
+        const after = typeof parsed.after === "string" ? parsed.after : "";
+
+        if (before.trim() || after.trim()) {
+          const parts = [];
+          if (before.trim()) parts.push(before);
+          if (body) parts.push(body);
+          if (after.trim()) parts.push(after);
+          return parts.join("\n\n");
+        }
+
+        return body;
       }
     } catch {
-      // Not JSON or parse failed
+      return rawCode;
     }
   }
 
   return rawCode;
 }
+
+const extractCleanCode = cleanRound2Code;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -1129,7 +1164,7 @@ export default async function handler(req) {
       .filter((test) => !test.is_hidden)
       .slice(0, 2);
 
-    const cleanImplementation = bodyOf(extractCleanCode(implementation));
+    const cleanImplementation = cleanRound2Code(implementation);
 
     const started = Date.now();
 

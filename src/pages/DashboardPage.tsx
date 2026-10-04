@@ -28,11 +28,9 @@ import { useAuth } from "../context/AuthContext";
 import { insforge } from "../lib/insforge";
 import { getServerNow, syncServerTime } from "../lib/serverTime";
 import {
-  extractCleanCode,
+  cleanRound2Code,
   parseStoredImplementation,
-  serializeEditorParts,
   type EditorParts,
-  EDITOR_STORAGE_PREFIX,
 } from "../lib/codeUtils";
 
 type TeamStatus = "PENDING" | "APPROVED" | "REJECTED";
@@ -540,10 +538,16 @@ function extractImplementation(
   document: string,
   question: Round2Question | null,
   language: ProgrammingLanguage,
-) {
-  return serializeEditorParts(
-    extractEditorParts(document, question, language),
-  );
+): string {
+  const parts = extractEditorParts(document, question, language);
+  if (parts.before || parts.after) {
+    const combined: string[] = [];
+    if (parts.before) combined.push(parts.before);
+    if (parts.body) combined.push(parts.body);
+    if (parts.after) combined.push(parts.after);
+    return combined.join("\n\n");
+  }
+  return parts.body;
 }
 
 function createLanguage(language: ProgrammingLanguage) {
@@ -1206,10 +1210,10 @@ function FunctionCodeEditor({
       const formattedBody = formatImplementationBody(body, languageRef.current);
       if (!formattedBody.trim()) throw new Error("The formatter returned empty code.");
 
-      const formattedImplementation = serializeEditorParts({
-        ...parts,
-        body: formattedBody,
-      });
+      const formattedImplementation =
+        parts.before || parts.after
+          ? [parts.before, formattedBody, parts.after].filter(Boolean).join("\n\n")
+          : formattedBody;
       const signatureLine = languageRef.current === "python"
         ? signature
         : `${signature} {`;
@@ -1670,9 +1674,10 @@ export function DashboardPage() {
             ? saved.language
             : "c";
 
+        const cleanSavedCode = cleanRound2Code(saved.code ?? "");
         setLanguage(savedLanguage);
-        setCode(saved.code ?? "");
-        codeRef.current = saved.code ?? "";
+        setCode(cleanSavedCode);
+        codeRef.current = cleanSavedCode;
         setLoadedCodeStageKey(
           `${currentSession.id}:${currentSession.coding_stage ?? "STUDENT_2"}:${currentQuestion.question_id}`,
         );
@@ -1985,6 +1990,7 @@ export function DashboardPage() {
       setCodeError(null);
 
       try {
+        const cleanCodeToSave = cleanRound2Code(nextCode);
         const result = await insforge.database.rpc(
           "save_round2_team_code_for_member",
           {
@@ -1992,7 +1998,7 @@ export function DashboardPage() {
             p_team_id: team.id,
             p_question_id: round2Question.question_id,
             p_language: nextLanguage,
-            p_code: nextCode,
+            p_code: cleanCodeToSave,
           },
         );
 
@@ -2150,9 +2156,10 @@ export function DashboardPage() {
       return;
     }
 
+    const restoredCode = cleanRound2Code(snapshot.code);
     setLanguage(snapshot.language);
-    codeRef.current = snapshot.code;
-    setCode(snapshot.code);
+    codeRef.current = restoredCode;
+    setCode(restoredCode);
     setSubmissionDirty(false);
     setCodeSaveMessage("Restored last submitted code");
     setCodeError(null);
@@ -2197,7 +2204,7 @@ export function DashboardPage() {
             team_id: team.id,
             question_id: round2Question.question_id,
             language,
-            implementation: codeRef.current,
+            implementation: cleanRound2Code(codeRef.current),
             action: "submit",
             final_submission: true,
           },
@@ -2241,7 +2248,7 @@ export function DashboardPage() {
       setCodeRunResult(null);
 
       const snapshot: SubmissionSnapshot = {
-        code: codeRef.current,
+        code: cleanRound2Code(codeRef.current),
         language,
         status: "SUBMITTED",
         submitted_at: new Date().toISOString(),
@@ -2317,7 +2324,7 @@ export function DashboardPage() {
             team_id: team.id,
             question_id: round2Question.question_id,
             language,
-            implementation: codeRef.current,
+            implementation: cleanRound2Code(codeRef.current),
             action: "run",
             final_submission: false,
           },

@@ -7,21 +7,28 @@ export interface EditorParts {
 }
 
 /**
- * Extract clean, plain source code from raw code or an editor wrapper.
+ * Clean Round 2 code by removing any editor metadata wrapper.
  *
  * Requirements:
- * - If rawCode starts with __CODERELAY_EDITOR_V1__, parse JSON safely and return the body.
- * - If rawCode is a raw JSON string with a "body" property, return the body.
- * - If JSON parsing fails, safely fall back without throwing errors.
- * - If rawCode does not start with the prefix, return rawCode as-is.
- * - If null or undefined, return an empty string.
+ * - CASE A (already clean code): Return rawCode exactly as-is.
+ * - CASE B (wrapped code with empty before/after): Return body exactly as-is.
+ * - CASE C (wrapper with before/after content): Return combined source:
+ *     before + body + after according to existing editor architecture.
+ * - CASE D (malformed wrapper): Safely fall back to rawCode without throwing or losing code.
+ * - CASE E (empty / null / undefined code): Return empty string "".
+ *
+ * CRITICAL: The student's code itself must NEVER be modified, corrected, reformatted, or "fixed".
+ * Only the editor metadata wrapper must be removed.
  */
-export function extractCleanCode(rawCode: string | null | undefined): string {
+export function cleanRound2Code(rawCode: string | null | undefined): string {
   if (!rawCode || typeof rawCode !== "string") {
     return "";
   }
 
   const trimmed = rawCode.trim();
+  if (!trimmed) {
+    return "";
+  }
 
   if (trimmed.startsWith(EDITOR_STORAGE_PREFIX)) {
     try {
@@ -29,11 +36,28 @@ export function extractCleanCode(rawCode: string | null | undefined): string {
         trimmed.slice(EDITOR_STORAGE_PREFIX.length),
       ) as Partial<EditorParts>;
 
-      if (typeof parsed?.body === "string") {
-        return parsed.body;
+      if (parsed && typeof parsed === "object") {
+        const before = typeof parsed.before === "string" ? parsed.before : "";
+        const body = typeof parsed.body === "string" ? parsed.body : "";
+        const after = typeof parsed.after === "string" ? parsed.after : "";
+
+        // CASE C: wrapper with before/after content
+        if (before.trim() || after.trim()) {
+          const parts: string[] = [];
+          if (before.trim()) parts.push(before);
+          if (body) parts.push(body);
+          if (after.trim()) parts.push(after);
+          return parts.join("\n\n");
+        }
+
+        // CASE B: standard wrapped code
+        if (typeof parsed.body === "string") {
+          return parsed.body;
+        }
       }
     } catch {
-      // JSON parsing failed, safely fall back without throwing errors
+      // CASE D: Malformed wrapper. Safely fall back without destroying student code.
+      return rawCode;
     }
   }
 
@@ -41,16 +65,39 @@ export function extractCleanCode(rawCode: string | null | undefined): string {
   if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
     try {
       const parsed = JSON.parse(trimmed) as Partial<EditorParts>;
-      if (typeof parsed?.body === "string") {
-        return parsed.body;
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        typeof parsed.body === "string"
+      ) {
+        const before = typeof parsed.before === "string" ? parsed.before : "";
+        const body = parsed.body;
+        const after = typeof parsed.after === "string" ? parsed.after : "";
+
+        if (before.trim() || after.trim()) {
+          const parts: string[] = [];
+          if (before.trim()) parts.push(before);
+          if (body) parts.push(body);
+          if (after.trim()) parts.push(after);
+          return parts.join("\n\n");
+        }
+
+        return body;
       }
     } catch {
-      // Not JSON or parse failed
+      // Not JSON or parse failed - safely fall back to rawCode
+      return rawCode;
     }
   }
 
+  // CASE A: already clean code
   return rawCode;
 }
+
+/**
+ * Backward compatibility alias for cleanRound2Code.
+ */
+export const extractCleanCode = cleanRound2Code;
 
 /**
  * Parse a stored implementation into its constituent editor sections
@@ -109,7 +156,8 @@ export function parseStoredImplementation(
 }
 
 /**
- * Serialize editor sections into the internal storage wrapper format.
+ * Legacy serialization helper. Maintained for backward compatibility.
+ * Do NOT use to wrap code before saving to database.
  */
 export function serializeEditorParts(parts: EditorParts): string {
   return (

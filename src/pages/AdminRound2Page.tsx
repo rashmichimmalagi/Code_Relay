@@ -8,7 +8,7 @@ import {
 import { insforge } from "../lib/insforge";
 import { useAuth } from "../context/AuthContext";
 import { getServerNow, syncServerTime } from "../lib/serverTime";
-import { extractCleanCode } from "../lib/codeUtils";
+import { cleanRound2Code } from "../lib/codeUtils";
 
 type Round2Phase =
   | "CONFIGURED"
@@ -2717,7 +2717,7 @@ export default function AdminRound2Page() {
                     const matchingCode = teamCodes.find(
                       (c) => c.team_id === result.team_id && c.question_id === result.question_id,
                     );
-                    const cleanCode = extractCleanCode(matchingCode?.code ?? "");
+                    const cleanCode = cleanRound2Code(matchingCode?.code ?? "");
 
                     return (
                       <tr key={result.id} className="hover:bg-white/[0.02]">
