@@ -51,6 +51,28 @@ type Round2Team = {
   student_3_name: string;
 };
 
+type Round2FinalResult = {
+  id: string;
+  team_id: string;
+  question_id: string;
+  language: string;
+  passed_cases: number;
+  failed_cases: number;
+  total_cases: number;
+  score: number;
+  max_score: number;
+  status: "SOLVED" | "ATTEMPTED";
+  submitted_at: string;
+};
+
+type Round2TeamCodeItem = {
+  team_id: string;
+  question_id: string;
+  language: string;
+  code: string;
+  updated_at: string;
+};
+
 type Round2Session = {
   id: string;
   question_id: string | null;
@@ -165,6 +187,24 @@ export default function AdminRound2Page() {
 
   const [showQuestionForm, setShowQuestionForm] =
     useState(false);
+
+  const [finalResults, setFinalResults] =
+    useState<Round2FinalResult[]>([]);
+
+  const [teamCodes, setTeamCodes] =
+    useState<Round2TeamCodeItem[]>([]);
+
+  const [loadingMarks, setLoadingMarks] =
+    useState(false);
+
+  const [viewingCodeModal, setViewingCodeModal] =
+    useState<{
+      teamNumber: number;
+      teamName: string;
+      questionTitle: string;
+      language: string;
+      code: string;
+    } | null>(null);
 
   const [message, setMessage] =
     useState<string | null>(null);
@@ -383,9 +423,35 @@ export default function AdminRound2Page() {
       }
     }, []);
 
+  const loadMarks = useCallback(async () => {
+    try {
+      setLoadingMarks(true);
+      const [resultsRes, codesRes] = await Promise.all([
+        insforge.database
+          .from("round2_final_results")
+          .select("*")
+          .order("submitted_at", { ascending: false }),
+        insforge.database
+          .from("round2_team_code")
+          .select("team_id, question_id, language, code, updated_at"),
+      ]);
+
+      if (resultsRes.data) {
+        setFinalResults(resultsRes.data as Round2FinalResult[]);
+      }
+      if (codesRes.data) {
+        setTeamCodes(codesRes.data as Round2TeamCodeItem[]);
+      }
+    } catch (err) {
+      console.error("Round 2 marks loading failed:", err);
+    } finally {
+      setLoadingMarks(false);
+    }
+  }, []);
+
   /*
    * --------------------------------------------------
-   * INITIAL LOAD
+   * INITIAL LOAD & LIVE MARKS POLLING
    * --------------------------------------------------
    */
 
@@ -398,6 +464,7 @@ export default function AdminRound2Page() {
           loadQuestions(),
           loadTeams(),
           loadSession(),
+          loadMarks(),
         ]);
       } finally {
         if (!cancelled) {
@@ -415,7 +482,18 @@ export default function AdminRound2Page() {
     loadQuestions,
     loadTeams,
     loadSession,
+    loadMarks,
   ]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void loadMarks();
+    }, 5000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [loadMarks]);
 
   /*
    * --------------------------------------------------
@@ -2582,6 +2660,128 @@ export default function AdminRound2Page() {
           )}
         </section>
 
+        {/* OFFICIAL MARKS & SUBMISSIONS */}
+        <section className="mb-8 rounded-2xl border border-white/10 bg-white/5 p-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-wider text-emerald-400">
+                Official Results
+              </p>
+              <h2 className="mt-1 text-xl font-semibold">
+                Student 3 Final Marks &amp; Submissions
+              </h2>
+              <p className="mt-1 text-sm text-slate-400">
+                Official marks recorded on Student 3 submission (score calculated out of 30).
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className="rounded-xl border border-white/10 bg-black/30 px-3 py-1.5 text-xs text-slate-300">
+                {finalResults.length} {finalResults.length === 1 ? "Result" : "Results"}
+              </span>
+              <button
+                type="button"
+                onClick={() => void loadMarks()}
+                disabled={loadingMarks}
+                className="rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-xs font-semibold text-slate-200 hover:bg-white/10 disabled:opacity-50"
+              >
+                {loadingMarks ? "Refreshing..." : "Refresh Marks"}
+              </button>
+            </div>
+          </div>
+
+          {finalResults.length === 0 ? (
+            <div className="mt-6 rounded-xl border border-dashed border-white/10 p-8 text-center">
+              <p className="text-sm text-slate-400">
+                No official submissions recorded yet. Marks will appear immediately after Student 3 submits.
+              </p>
+            </div>
+          ) : (
+            <div className="mt-6 overflow-x-auto">
+              <table className="w-full text-left text-sm text-slate-300">
+                <thead className="border-b border-white/10 text-xs uppercase tracking-wider text-slate-500">
+                  <tr>
+                    <th className="pb-3 pr-4 font-semibold">Team</th>
+                    <th className="pb-3 pr-4 font-semibold">Question</th>
+                    <th className="pb-3 pr-4 font-semibold">Lang</th>
+                    <th className="pb-3 pr-4 font-semibold">Cases (P / F / Total)</th>
+                    <th className="pb-3 pr-4 font-semibold">Score (30 max)</th>
+                    <th className="pb-3 pr-4 font-semibold">Status</th>
+                    <th className="pb-3 pr-4 font-semibold">Submitted At</th>
+                    <th className="pb-3 font-semibold text-right">Code</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {finalResults.map((result) => {
+                    const team = teams.find((t) => t.id === result.team_id);
+                    const question = questions.find((q) => q.id === result.question_id);
+                    const matchingCode = teamCodes.find(
+                      (c) => c.team_id === result.team_id && c.question_id === result.question_id,
+                    );
+                    const cleanCode = extractCleanCode(matchingCode?.code ?? "");
+
+                    return (
+                      <tr key={result.id} className="hover:bg-white/[0.02]">
+                        <td className="py-3.5 pr-4 font-medium text-white">
+                          <span className="text-cyan-400 font-semibold">
+                            #{team?.team_number ?? "—"}
+                          </span>{" "}
+                          {team?.team_name ?? "Unknown Team"}
+                        </td>
+                        <td className="py-3.5 pr-4 text-slate-200">
+                          {question?.title ?? "Assigned Question"}
+                        </td>
+                        <td className="py-3.5 pr-4 uppercase text-xs font-mono text-cyan-300">
+                          {result.language}
+                        </td>
+                        <td className="py-3.5 pr-4 font-mono text-xs text-slate-300">
+                          <span className="text-emerald-400 font-semibold">{result.passed_cases}</span> /{" "}
+                          <span className="text-red-400 font-semibold">{result.failed_cases}</span> /{" "}
+                          <span>{result.total_cases}</span>
+                        </td>
+                        <td className="py-3.5 pr-4 font-mono font-bold text-base">
+                          <span className={result.score === 30 ? "text-emerald-400" : result.score > 0 ? "text-cyan-300" : "text-red-400"}>
+                            {Number(result.score).toFixed(2)}
+                          </span>
+                          <span className="text-xs text-slate-500 font-normal"> / {result.max_score}</span>
+                        </td>
+                        <td className="py-3.5 pr-4">
+                          <span className={`inline-flex rounded-lg px-2.5 py-1 text-xs font-semibold ${
+                            result.status === "SOLVED"
+                              ? "bg-emerald-400/10 text-emerald-300 border border-emerald-400/20"
+                              : "bg-amber-400/10 text-amber-300 border border-amber-400/20"
+                          }`}>
+                            {result.status}
+                          </span>
+                        </td>
+                        <td className="py-3.5 pr-4 text-xs text-slate-400">
+                          {new Date(result.submitted_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                        </td>
+                        <td className="py-3.5 text-right">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setViewingCodeModal({
+                                teamNumber: team?.team_number ?? 0,
+                                teamName: team?.team_name ?? "Team",
+                                questionTitle: question?.title ?? "Question",
+                                language: result.language,
+                                code: cleanCode || "// No saved code found",
+                              });
+                            }}
+                            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-cyan-300 hover:bg-white/10"
+                          >
+                            View Code
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
         {/* QUESTION BANK */}
 
         <section className="rounded-2xl border border-white/10 bg-white/5 p-6">
@@ -3087,6 +3287,36 @@ export default function AdminRound2Page() {
               This Round 2 session has finished.
             </p>
           </section>
+        )}
+
+        {/* CODE VIEWER MODAL */}
+        {viewingCodeModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
+            <div className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-2xl border border-white/10 bg-slate-900 shadow-2xl">
+              <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+                <div>
+                  <h3 className="text-base font-bold text-white">
+                    Team #{viewingCodeModal.teamNumber} — {viewingCodeModal.teamName}
+                  </h3>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {viewingCodeModal.questionTitle} • <span className="uppercase font-mono text-cyan-300">{viewingCodeModal.language}</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setViewingCodeModal(null)}
+                  className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-white/10"
+                >
+                  Close
+                </button>
+              </div>
+              <div className="overflow-auto p-6">
+                <pre className="rounded-xl border border-white/10 bg-slate-950 p-4 font-mono text-xs leading-6 text-cyan-200 overflow-x-auto whitespace-pre-wrap">
+                  {viewingCodeModal.code}
+                </pre>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </main>
