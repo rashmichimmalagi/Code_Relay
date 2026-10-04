@@ -26,6 +26,7 @@ import { cpp } from "@codemirror/lang-cpp";
 
 import { useAuth } from "../context/AuthContext";
 import { insforge } from "../lib/insforge";
+import { getServerNow, syncServerTime } from "../lib/serverTime";
 
 type TeamStatus = "PENDING" | "APPROVED" | "REJECTED";
 type ProgrammingLanguage = "c" | "python";
@@ -294,6 +295,36 @@ function formatOutputValue(value: unknown): string {
   return String(value);
 }
 
+function normalizeOutputForDisplay(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) {
+    return value.map(normalizeOutputForDisplay);
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const normalized: Record<string, unknown> = {};
+
+    const hasK = "k" in record;
+    const hasElementsArray = "elements" in record && Array.isArray(record.elements);
+
+    for (const [k, v] of Object.entries(record)) {
+      if (hasK && hasElementsArray && k === "elements" && Array.isArray(v)) {
+        const sorted = [...v].sort((a, b) => {
+          if (typeof a === "number" && typeof b === "number") {
+            return a - b;
+          }
+          return String(a).localeCompare(String(b));
+        });
+        normalized[k] = sorted.map(normalizeOutputForDisplay);
+      } else {
+        normalized[k] = normalizeOutputForDisplay(v);
+      }
+    }
+    return normalized;
+  }
+  return value;
+}
+
 function formatTestOutput(value: unknown): string {
   if (typeof value === "string") {
     try {
@@ -303,8 +334,10 @@ function formatTestOutput(value: unknown): string {
     }
   }
 
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return formatOutputValue(value);
+  const normalized = normalizeOutputForDisplay(value);
+
+  if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) {
+    return formatOutputValue(normalized);
   }
 
   const fields: string[] = [];
@@ -322,7 +355,7 @@ function formatTestOutput(value: unknown): string {
     }
   };
 
-  appendFields(value as Record<string, unknown>);
+  appendFields(normalized as Record<string, unknown>);
   return fields.join("\n") || "{}";
 }
 
@@ -1523,6 +1556,9 @@ export function DashboardPage() {
       previous,
       active,
     );
+    if (active?.phase === "QUESTION" || active?.phase === "CODING") {
+      void syncServerTime();
+    }
     round2SessionRef.current = active;
     if (!unchanged) setRound2Session(active);
     return active;
@@ -1880,10 +1916,12 @@ export function DashboardPage() {
       return;
     }
 
+    void syncServerTime();
+
     const update = () => {
       const start =
         new Date(round2Session.phase_started_at!).getTime();
-      const elapsed = Math.floor((Date.now() - start) / 1000);
+      const elapsed = Math.floor((getServerNow() - start) / 1000);
 
       const codingStage =
         round2Session.coding_stage ?? "STUDENT_2";
@@ -1909,9 +1947,13 @@ export function DashboardPage() {
 
       if (round2Session.phase === "CODING") {
         const stageKey = `${round2Session.id}:${codingStage}:${round2Session.phase_started_at}`;
-        if (expiredCodingStageKeyRef.current === stageKey || nextRemaining <= 0) {
-          expiredCodingStageKeyRef.current = stageKey;
-          nextRemaining = 0;
+        if (nextRemaining <= 0 || expiredCodingStageKeyRef.current === stageKey) {
+          if (nextRemaining <= 0) {
+            expiredCodingStageKeyRef.current = stageKey;
+            nextRemaining = 0;
+          } else {
+            expiredCodingStageKeyRef.current = null;
+          }
         }
       } else {
         expiredCodingStageKeyRef.current = null;

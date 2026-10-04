@@ -7,6 +7,7 @@ import {
 
 import { insforge } from "../lib/insforge";
 import { useAuth } from "../context/AuthContext";
+import { getServerNow, syncServerTime } from "../lib/serverTime";
 
 type Round2Phase =
   | "CONFIGURED"
@@ -331,6 +332,13 @@ export default function AdminRound2Page() {
 
         setSession(current);
 
+        if (
+          current?.phase === "QUESTION" ||
+          current?.phase === "CODING"
+        ) {
+          void syncServerTime();
+        }
+
         if (current) {
           setQuestionMinutes(
             Math.max(
@@ -550,6 +558,8 @@ export default function AdminRound2Page() {
       return;
     }
 
+    void syncServerTime();
+
     const updateTimer = () => {
       const startedAt =
         new Date(
@@ -558,7 +568,7 @@ export default function AdminRound2Page() {
 
       const elapsedSeconds =
         Math.floor(
-          (Date.now() -
+          (getServerNow() -
             startedAt) /
             1000,
         );

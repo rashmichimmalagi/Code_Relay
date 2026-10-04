@@ -861,21 +861,45 @@ export default async function handler(req) {
     }
 
     /*
-     * Creator-only identity:
-     * the authenticated account that created the approved team is the
-     * authenticated identity for the entire physical 3-student relay.
-     *
-     * This is deliberately NOT based on student_2_name/student_3_name.
+     * Creator-only identity & authorization checks:
+     * Parallelize pre-judge database queries to minimize latency.
      */
     let teamRows;
+    let memberCheck;
+    let sessionRows;
+    let expectedQuestion;
 
     try {
-      teamRows = await dbRpc(
-        insforgeUrl,
-        accessToken,
-        "get_round2_team_for_creator",
-        { p_team_id: teamId },
-      );
+      [teamRows, memberCheck, sessionRows, expectedQuestion] = await Promise.all([
+        dbRpc(
+          insforgeUrl,
+          accessToken,
+          "get_round2_team_for_creator",
+          { p_team_id: teamId },
+        ),
+        dbRpc(
+          insforgeUrl,
+          accessToken,
+          "coderelay_user_is_team_member",
+          { p_team_id: teamId },
+        ),
+        dbRecords(
+          insforgeUrl,
+          accessToken,
+          "round2_sessions",
+          [
+            `id=eq.${queryValue(sessionId)}`,
+            "select=id,phase,coding_stage",
+            "limit=1",
+          ].join("&"),
+        ),
+        dbRpc(
+          insforgeUrl,
+          accessToken,
+          "get_round2_question_for_team",
+          { p_team_id: teamId },
+        ),
+      ]);
     } catch (error) {
       if (error?.status === 404) {
         return json({ error: "Team not found" }, 404);
@@ -906,13 +930,6 @@ export default async function handler(req) {
      * Defense-in-depth membership check. The SQL function should also be
      * creator-only after the Round 2 identity migration.
      */
-    const memberCheck = await dbRpc(
-      insforgeUrl,
-      accessToken,
-      "coderelay_user_is_team_member",
-      { p_team_id: teamId },
-    );
-
     if (!isTruthyRpc(memberCheck)) {
       return json(
         {
@@ -921,17 +938,6 @@ export default async function handler(req) {
         403,
       );
     }
-
-    const sessionRows = await dbRecords(
-      insforgeUrl,
-      accessToken,
-      "round2_sessions",
-      [
-        `id=eq.${queryValue(sessionId)}`,
-        "select=id,phase,coding_stage",
-        "limit=1",
-      ].join("&"),
-    );
 
     const session = firstRow(sessionRows);
 
@@ -967,13 +973,6 @@ export default async function handler(req) {
      * database RPC. This prevents a client from selecting another team's
      * question by sending a different question_id.
      */
-    const expectedQuestion = await dbRpc(
-      insforgeUrl,
-      accessToken,
-      "get_round2_question_for_team",
-      { p_team_id: teamId },
-    );
-
     const resolved = firstRow(expectedQuestion);
 
     if (!resolved || resolved.question_id !== questionId) {
@@ -1002,12 +1001,40 @@ export default async function handler(req) {
       );
     }
 
-    const configResult = await dbRpc(
-      insforgeUrl,
-      accessToken,
-      "get_round2_judge_config",
-      { p_question_id: questionId },
-    );
+    /*
+     * Hidden tests are fetched only with the server-side API key.
+     * The student's JWT is never used to retrieve the hidden test suite.
+     */
+    const serviceKey = Deno.env.get("API_KEY");
+
+    if (!serviceKey) {
+      return json(
+        {
+          error: "Server judge is not configured",
+          details: "API_KEY is missing",
+        },
+        503,
+      );
+    }
+
+    const [configResult, testsRows] = await Promise.all([
+      dbRpc(
+        insforgeUrl,
+        accessToken,
+        "get_round2_judge_config",
+        { p_question_id: questionId },
+      ),
+      dbRecords(
+        insforgeUrl,
+        serviceKey,
+        "round2_test_cases",
+        [
+          `question_id=eq.${queryValue(questionId)}`,
+          "select=id,input_data,expected_output,is_hidden,created_at",
+          "order=created_at.asc",
+        ].join("&"),
+      ),
+    ]);
 
     const configRow = firstRow(configResult);
     const judgeConfig =
@@ -1025,33 +1052,6 @@ export default async function handler(req) {
       );
     }
 
-    /*
-     * Hidden tests are fetched only with the server-side API key.
-     * The student's JWT is never used to retrieve the hidden test suite.
-     */
-    const serviceKey = Deno.env.get("API_KEY");
-
-    if (!serviceKey) {
-      return json(
-        {
-          error: "Server judge is not configured",
-          details: "API_KEY is missing",
-        },
-        503,
-      );
-    }
-
-    const testsRows = await dbRecords(
-      insforgeUrl,
-      serviceKey,
-      "round2_test_cases",
-      [
-        `question_id=eq.${queryValue(questionId)}`,
-        "select=id,input_data,expected_output,is_hidden,created_at",
-        "order=created_at.asc",
-      ].join("&"),
-    );
-
     const tests = Array.isArray(testsRows) ? testsRows : [];
 
     if (tests.length === 0) {
@@ -1067,61 +1067,88 @@ export default async function handler(req) {
 
     const cleanImplementation = bodyOf(implementation);
 
-    let passedTests = 0;
-    let last = null;
-
-    const visibleCases = [];
     const started = Date.now();
 
     /*
-     * Every configured case is executed.
-     * The browser receives ONLY the first two visible cases.
+     * Controlled concurrency for Judge0 submissions:
+     * Run up to 5 concurrent submissions to drastically reduce latency
+     * without overwhelming Judge0 when multiple teams run code simultaneously.
      */
+    const CONCURRENCY_LIMIT = 5;
+    const testResults = new Array(tests.length);
+    let nextTestIndex = 0;
+
+    const workers = Array.from(
+      { length: Math.min(CONCURRENCY_LIMIT, tests.length) },
+      async () => {
+        while (nextTestIndex < tests.length) {
+          const index = nextTestIndex++;
+          const test = tests[index];
+
+          const source = buildSource(
+            language,
+            String(signature).trim(),
+            cleanImplementation,
+            test,
+            kind,
+          );
+
+          const result = await submit(
+            judgeUrl,
+            Deno.env.get("JUDGE0_AUTH_TOKEN"),
+            LANGUAGE_IDS[language],
+            source,
+          );
+
+          testResults[index] = result;
+        }
+      },
+    );
+
+    await Promise.all(workers);
+
+    let passedTests = 0;
+    let representativeResult = testResults[testResults.length - 1] ?? null;
+    let errorResult = null;
+
     for (let index = 0; index < tests.length; index++) {
-      const test = tests[index];
-
-      const source = buildSource(
-        language,
-        String(signature).trim(),
-        cleanImplementation,
-        test,
-        kind,
-      );
-
-      const result = await submit(
-        judgeUrl,
-        Deno.env.get("JUDGE0_AUTH_TOKEN"),
-        LANGUAGE_IDS[language],
-        source,
-      );
-
-      last = result;
-
+      const result = testResults[index];
       const casePassed = passed(result);
 
       if (casePassed) {
         passedTests++;
-      }
-
-      const visibleIndex = visibleTests.findIndex(
-        (visible) => visible.id === test.id,
-      );
-
-      if (visibleIndex >= 0) {
-        visibleCases.push({
-          case_number: visibleIndex + 1,
-          input_data: test.input_data,
-          output:
-            actualOutput(result) ??
-            String(result.stdout ?? "").trim(),
-          expected_output: test.expected_output,
-          passed: casePassed,
-        });
+      } else {
+        if (!errorResult && result?.status?.id && result.status.id !== 3) {
+          errorResult = result;
+        }
+        if (!representativeResult || representativeResult.status?.id === 3) {
+          representativeResult = result;
+        }
       }
     }
 
+    const last = errorResult || representativeResult;
+
+    const visibleCases = [];
+    for (let vIdx = 0; vIdx < visibleTests.length; vIdx++) {
+      const visible = visibleTests[vIdx];
+      const testIndex = tests.findIndex((t) => t.id === visible.id);
+      const result = testIndex >= 0 ? testResults[testIndex] : null;
+      const casePassed = result ? passed(result) : false;
+
+      visibleCases.push({
+        case_number: vIdx + 1,
+        input_data: visible.input_data,
+        output:
+          actualOutput(result) ??
+          String(result?.stdout ?? "").trim(),
+        expected_output: visible.expected_output,
+        passed: casePassed,
+      });
+    }
+
     const finalStatus =
-      last?.status?.id === 3
+      !errorResult && last?.status?.id === 3
         ? passedTests === tests.length
           ? "COMPLETED"
           : "WRONG_ANSWER"
