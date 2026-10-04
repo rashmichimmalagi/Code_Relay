@@ -40,6 +40,42 @@ const LANGUAGE_IDS = {
 
 const EDITOR_STORAGE_PREFIX = "__CODERELAY_EDITOR_V1__";
 
+function extractCleanCode(rawCode) {
+  if (!rawCode || typeof rawCode !== "string") {
+    return "";
+  }
+
+  const trimmed = rawCode.trim();
+
+  if (trimmed.startsWith(EDITOR_STORAGE_PREFIX)) {
+    try {
+      const parsed = JSON.parse(
+        trimmed.slice(EDITOR_STORAGE_PREFIX.length),
+      );
+
+      if (typeof parsed?.body === "string") {
+        return parsed.body;
+      }
+    } catch {
+      // JSON parsing failed, safely fall back without throwing errors
+    }
+  }
+
+  // Handle case where raw wrapper JSON was stored without prefix
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed?.body === "string") {
+        return parsed.body;
+      }
+    } catch {
+      // Not JSON or parse failed
+    }
+  }
+
+  return rawCode;
+}
+
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -196,19 +232,45 @@ printf("]\\n");
 }
 
 function parseStoredImplementation(implementation) {
-  if (implementation.startsWith(EDITOR_STORAGE_PREFIX)) {
+  if (!implementation || typeof implementation !== "string") {
+    return { before: "", body: "", after: "" };
+  }
+
+  const trimmed = implementation.trim();
+
+  if (trimmed.startsWith(EDITOR_STORAGE_PREFIX)) {
     try {
       const parsed = JSON.parse(
-        implementation.slice(EDITOR_STORAGE_PREFIX.length),
+        trimmed.slice(EDITOR_STORAGE_PREFIX.length),
       );
 
       return {
-        before: typeof parsed.before === "string" ? parsed.before : "",
-        body: typeof parsed.body === "string" ? parsed.body : "",
-        after: typeof parsed.after === "string" ? parsed.after : "",
+        before: typeof parsed?.before === "string" ? parsed.before : "",
+        body: typeof parsed?.body === "string" ? parsed.body : "",
+        after: typeof parsed?.after === "string" ? parsed.after : "",
       };
     } catch {
       // Legacy body-only format.
+    }
+  }
+
+  // Handle case where raw wrapper JSON was stored without prefix
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (
+        typeof parsed?.body === "string" ||
+        typeof parsed?.before === "string" ||
+        typeof parsed?.after === "string"
+      ) {
+        return {
+          before: typeof parsed?.before === "string" ? parsed.before : "",
+          body: typeof parsed?.body === "string" ? parsed.body : "",
+          after: typeof parsed?.after === "string" ? parsed.after : "",
+        };
+      }
+    } catch {
+      // Fallback
     }
   }
 
@@ -763,11 +825,10 @@ function statusFor(result) {
   const id = result?.status?.id;
 
   if (id === 3) return "COMPLETED";
-  if (id === 4 || id === 6) return "COMPILATION_ERROR";
-  if (id === 5 || id === 9) return "TIME_LIMIT";
-  if (id === 7 || id === 8 || id === 11 || id === 12) {
-    return "RUNTIME_ERROR";
-  }
+  if (id === 4) return "WRONG_ANSWER";
+  if (id === 5) return "TIME_LIMIT";
+  if (id === 6) return "COMPILATION_ERROR";
+  if (id >= 7 && id <= 12) return "RUNTIME_ERROR";
   if (id === 13 || id === 14) return "SYSTEM_ERROR";
 
   return "SYSTEM_ERROR";
@@ -831,7 +892,10 @@ export default async function handler(req) {
     const questionId = input?.question_id;
     const language = input?.language;
     const implementation = input?.implementation;
-    const finalSubmission = input?.final_submission === true;
+    const action = input?.action;
+    const finalSubmission =
+      action === "submit" ||
+      (input?.final_submission === true && action !== "run");
 
     if (
       !sessionId ||
@@ -1065,7 +1129,7 @@ export default async function handler(req) {
       .filter((test) => !test.is_hidden)
       .slice(0, 2);
 
-    const cleanImplementation = bodyOf(implementation);
+    const cleanImplementation = bodyOf(extractCleanCode(implementation));
 
     const started = Date.now();
 
@@ -1110,15 +1174,22 @@ export default async function handler(req) {
     let passedTests = 0;
     let representativeResult = testResults[testResults.length - 1] ?? null;
     let errorResult = null;
+    let compilationErrorResult = null;
 
     for (let index = 0; index < tests.length; index++) {
       const result = testResults[index];
+      const statusId = result?.status?.id;
+
+      if (statusId === 6 && !compilationErrorResult) {
+        compilationErrorResult = result;
+      }
+
       const casePassed = passed(result);
 
       if (casePassed) {
         passedTests++;
       } else {
-        if (!errorResult && result?.status?.id && result.status.id !== 3) {
+        if (!errorResult && statusId && statusId !== 3) {
           errorResult = result;
         }
         if (!representativeResult || representativeResult.status?.id === 3) {
@@ -1127,32 +1198,60 @@ export default async function handler(req) {
       }
     }
 
-    const last = errorResult || representativeResult;
+    const hasCompilationError = Boolean(compilationErrorResult);
+
+    // Compilation error must never receive passed tests or full marks
+    if (hasCompilationError) {
+      passedTests = 0;
+    }
+
+    const last = compilationErrorResult || errorResult || representativeResult;
 
     const visibleCases = [];
     for (let vIdx = 0; vIdx < visibleTests.length; vIdx++) {
       const visible = visibleTests[vIdx];
       const testIndex = tests.findIndex((t) => t.id === visible.id);
       const result = testIndex >= 0 ? testResults[testIndex] : null;
-      const casePassed = result ? passed(result) : false;
+      const casePassed = hasCompilationError ? false : (result ? passed(result) : false);
+
+      let caseOutput = actualOutput(result) ?? String(result?.stdout ?? "").trim();
+      const caseStatusId = result?.status?.id;
+
+      if (hasCompilationError || caseStatusId === 6) {
+        const compileMsg =
+          result?.compile_output?.trim() ||
+          compilationErrorResult?.compile_output?.trim() ||
+          last?.compile_output?.trim();
+        caseOutput = compileMsg ? `Compilation Error:\n${compileMsg}` : "Compilation Error";
+      } else if (caseStatusId >= 7 && caseStatusId <= 12) {
+        const runtimeMsg =
+          result?.stderr?.trim() ||
+          result?.message?.trim() ||
+          result?.status?.description;
+        caseOutput = runtimeMsg ? `Runtime Error:\n${runtimeMsg}` : "Runtime Error";
+      } else if (caseStatusId === 5) {
+        caseOutput = "Time Limit Exceeded";
+      } else if (!casePassed && !caseOutput) {
+        caseOutput = result?.status?.description || "Wrong Answer";
+      }
 
       visibleCases.push({
         case_number: vIdx + 1,
         input_data: visible.input_data,
-        output:
-          actualOutput(result) ??
-          String(result?.stdout ?? "").trim(),
+        output: caseOutput,
         expected_output: visible.expected_output,
         passed: casePassed,
       });
     }
 
-    const finalStatus =
-      !errorResult && last?.status?.id === 3
-        ? passedTests === tests.length
-          ? "COMPLETED"
-          : "WRONG_ANSWER"
-        : statusFor(last);
+    let finalStatus = "COMPLETED";
+    if (hasCompilationError) {
+      finalStatus = "COMPILATION_ERROR";
+    } else if (errorResult) {
+      finalStatus = statusFor(errorResult);
+    } else if (passedTests < tests.length) {
+      finalStatus = "WRONG_ANSWER";
+    }
 
     const executionTime = Date.now() - started;
 
@@ -1169,7 +1268,7 @@ export default async function handler(req) {
         p_team_id: teamId,
         p_question_id: questionId,
         p_language: language,
-        p_source_code: "Server-generated judge source",
+        p_source_code: cleanImplementation || "No source code provided",
         p_status: finalStatus,
         p_passed_tests: passedTests,
         p_total_tests: tests.length,
@@ -1180,6 +1279,7 @@ export default async function handler(req) {
         p_error_message:
           last?.stderr ??
           last?.message ??
+          (hasCompilationError ? last?.compile_output : null) ??
           null,
       },
     );
@@ -1202,12 +1302,13 @@ export default async function handler(req) {
      * Official 30-point result:
      * ONLY Student 3 final submission creates/updates this record.
      * Score is calculated from ALL configured visible + hidden cases.
+     * RUN requests MUST NEVER calculate or create/update final results.
      */
     let finalResultId = null;
 
     if (finalSubmission) {
       const totalCases = tests.length;
-      const passedCases = passedTests;
+      const passedCases = hasCompilationError ? 0 : passedTests;
       const failedCases = totalCases - passedCases;
 
       const visibleCaseCount = tests.filter(
@@ -1219,12 +1320,12 @@ export default async function handler(req) {
       ).length;
 
       const score =
-        totalCases > 0
-          ? Number(((passedCases / totalCases) * 30).toFixed(2))
-          : 0;
+        hasCompilationError || totalCases === 0
+          ? 0
+          : Number(((passedCases / totalCases) * 30).toFixed(2));
 
       const officialStatus =
-        passedCases === totalCases
+        !hasCompilationError && passedCases === totalCases && totalCases > 0
           ? "SOLVED"
           : "ATTEMPTED";
 
@@ -1336,6 +1437,7 @@ export default async function handler(req) {
       error_message:
         last?.stderr ??
         last?.message ??
+        (hasCompilationError ? last?.compile_output : null) ??
         null,
       visible_cases: visibleCases,
       ...(finalSubmission

@@ -27,6 +27,13 @@ import { cpp } from "@codemirror/lang-cpp";
 import { useAuth } from "../context/AuthContext";
 import { insforge } from "../lib/insforge";
 import { getServerNow, syncServerTime } from "../lib/serverTime";
+import {
+  extractCleanCode,
+  parseStoredImplementation,
+  serializeEditorParts,
+  type EditorParts,
+  EDITOR_STORAGE_PREFIX,
+} from "../lib/codeUtils";
 
 type TeamStatus = "PENDING" | "APPROVED" | "REJECTED";
 type ProgrammingLanguage = "c" | "python";
@@ -402,48 +409,6 @@ function indentImplementationForEditor(body: string) {
     .join("\n");
 }
 
-const EDITOR_STORAGE_PREFIX = "__CODERELAY_EDITOR_V1__";
-
-type EditorParts = {
-  before: string;
-  body: string;
-  after: string;
-};
-
-function parseStoredImplementation(implementation: string): EditorParts {
-  if (implementation.startsWith(EDITOR_STORAGE_PREFIX)) {
-    try {
-      const parsed = JSON.parse(
-        implementation.slice(EDITOR_STORAGE_PREFIX.length),
-      ) as Partial<EditorParts>;
-
-      return {
-        before: typeof parsed.before === "string" ? parsed.before : "",
-        body: typeof parsed.body === "string" ? parsed.body : "",
-        after: typeof parsed.after === "string" ? parsed.after : "",
-      };
-    } catch {
-      // Fall through to the legacy body-only format.
-    }
-  }
-
-  return {
-    before: "",
-    body: implementation,
-    after: "",
-  };
-}
-
-function serializeEditorParts(parts: EditorParts): string {
-  return (
-    EDITOR_STORAGE_PREFIX +
-    JSON.stringify({
-      before: parts.before,
-      body: parts.body,
-      after: parts.after,
-    })
-  );
-}
 
 function findPythonFunctionEnd(lines: string[], signatureIndex: number) {
   let bodyStarted = false;
@@ -2233,6 +2198,7 @@ export function DashboardPage() {
             question_id: round2Question.question_id,
             language,
             implementation: codeRef.current,
+            action: "submit",
             final_submission: true,
           },
         },
@@ -2352,6 +2318,7 @@ export function DashboardPage() {
             question_id: round2Question.question_id,
             language,
             implementation: codeRef.current,
+            action: "run",
             final_submission: false,
           },
         },
