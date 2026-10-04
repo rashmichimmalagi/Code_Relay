@@ -55,6 +55,8 @@ type Round2FinalResult = {
   id: string;
   team_id: string;
   question_id: string;
+  session_id?: string | null;
+  submitted_code?: string | null;
   language: string;
   passed_cases: number;
   failed_cases: number;
@@ -65,13 +67,7 @@ type Round2FinalResult = {
   submitted_at: string;
 };
 
-type Round2TeamCodeItem = {
-  team_id: string;
-  question_id: string;
-  language: string;
-  code: string;
-  updated_at: string;
-};
+
 
 type Round2Session = {
   id: string;
@@ -191,8 +187,7 @@ export default function AdminRound2Page() {
   const [finalResults, setFinalResults] =
     useState<Round2FinalResult[]>([]);
 
-  const [teamCodes, setTeamCodes] =
-    useState<Round2TeamCodeItem[]>([]);
+
 
   const [loadingMarks, setLoadingMarks] =
     useState(false);
@@ -426,22 +421,13 @@ export default function AdminRound2Page() {
   const loadMarks = useCallback(async () => {
     try {
       setLoadingMarks(true);
-      const [resultsRes, codesRes] = await Promise.all([
-        insforge.database
-          .from("round2_final_results")
-          .select("*")
-          .order("submitted_at", { ascending: false }),
-        insforge.database
-          .from("round2_team_code")
-          .select("team_id, question_id, language, code, updated_at")
-          .order("updated_at", { ascending: false }),
-      ]);
+      const resultsRes = await insforge.database
+        .from("round2_final_results")
+        .select("*")
+        .order("submitted_at", { ascending: false });
 
       if (resultsRes.data) {
         setFinalResults(resultsRes.data as Round2FinalResult[]);
-      }
-      if (codesRes.data) {
-        setTeamCodes(codesRes.data as Round2TeamCodeItem[]);
       }
     } catch (err) {
       console.error("Round 2 marks loading failed:", err);
@@ -455,9 +441,8 @@ export default function AdminRound2Page() {
     teamNumber: number,
     teamName: string,
     questionTitle: string,
-    initialCode: string,
   ) => {
-    let displayCode = initialCode;
+    let displayCode = result.submitted_code ? cleanRound2Code(result.submitted_code) : "";
     let displayLanguage = result.language;
 
     if (!displayCode || displayCode.trim().length === 0) {
@@ -467,7 +452,9 @@ export default function AdminRound2Page() {
           .select("source_code, language")
           .eq("team_id", result.team_id)
           .eq("question_id", result.question_id)
-          .order("created_at", { ascending: false })
+          .eq("language", result.language)
+          .lte("completed_at", result.submitted_at)
+          .order("completed_at", { ascending: false })
           .limit(1);
 
         if (runsRes.data?.[0]?.source_code) {
@@ -489,7 +476,7 @@ export default function AdminRound2Page() {
       teamName,
       questionTitle,
       language: displayLanguage,
-      code: displayCode || "// No saved code found",
+      code: displayCode && displayCode.trim().length > 0 ? displayCode : "// Submitted code snapshot unavailable",
     });
   }, []);
 
@@ -2761,19 +2748,6 @@ export default function AdminRound2Page() {
                   {finalResults.map((result) => {
                     const team = teams.find((t) => t.id === result.team_id);
                     const question = questions.find((q) => q.id === result.question_id);
-                    const matchingCode =
-                      teamCodes.find(
-                        (c) =>
-                          c.team_id === result.team_id &&
-                          c.question_id === result.question_id &&
-                          cleanRound2Code(c.code).trim().length > 0,
-                      ) ||
-                      teamCodes.find(
-                        (c) =>
-                          c.team_id === result.team_id &&
-                          c.question_id === result.question_id,
-                      );
-                    const cleanCode = cleanRound2Code(matchingCode?.code ?? "");
 
                     return (
                       <tr key={result.id} className="hover:bg-white/[0.02]">
@@ -2821,7 +2795,6 @@ export default function AdminRound2Page() {
                                 team?.team_number ?? 0,
                                 team?.team_name ?? "Team",
                                 question?.title ?? "Question",
-                                cleanCode,
                               );
                             }}
                             className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-cyan-300 hover:bg-white/10"

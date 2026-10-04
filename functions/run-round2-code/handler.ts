@@ -1388,9 +1388,11 @@ export default async function handler(req) {
       const existingResult = firstRow(existingRows);
 
       const resultPayload = {
+        session_id: sessionId,
         team_id: teamId,
         question_id: questionId,
         submitted_by: submittedBy,
+        submitted_code: cleanImplementation || "",
         language,
         total_cases: totalCases,
         passed_cases: passedCases,
@@ -1443,7 +1445,7 @@ export default async function handler(req) {
           `id=eq.${queryValue(finalResultId)}`,
           `team_id=eq.${queryValue(teamId)}`,
           `question_id=eq.${queryValue(questionId)}`,
-          "select=id,team_id,question_id,passed_cases,failed_cases,total_cases,score,max_score,status,submitted_at",
+          "select=id,session_id,team_id,question_id,submitted_code,passed_cases,failed_cases,total_cases,score,max_score,status,submitted_at",
           "limit=1",
         ].join("&"),
       );

@@ -2258,8 +2258,11 @@ export function DashboardPage() {
     setCodeSaveMessage(null);
 
     try {
+      // Snapshot the exact code at the moment Student 3 clicks Submit
+      const submittedCode = cleanRound2Code(codeRef.current);
+
       // Explicitly persist the latest editor code to round2_team_code before submit
-      await saveCode(codeRef.current, language);
+      await saveCode(submittedCode, language);
 
       // Submit performs a fresh server-side full test run. This is the only
       // request that creates/updates the official 30-mark result.
@@ -2271,7 +2274,7 @@ export function DashboardPage() {
             team_id: team.id,
             question_id: round2Question.question_id,
             language,
-            implementation: cleanRound2Code(codeRef.current),
+            implementation: submittedCode,
             action: "submit",
             final_submission: true,
           },
@@ -2315,7 +2318,7 @@ export function DashboardPage() {
       setCodeRunResult(null);
 
       const snapshot: SubmissionSnapshot = {
-        code: cleanRound2Code(codeRef.current),
+        code: submittedCode,
         language,
         status: "SUBMITTED",
         submitted_at: new Date().toISOString(),
