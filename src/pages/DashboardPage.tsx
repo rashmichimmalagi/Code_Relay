@@ -26,7 +26,7 @@ import { cpp } from "@codemirror/lang-cpp";
 
 import { useAuth } from "../context/AuthContext";
 import { insforge } from "../lib/insforge";
-import { getServerNow, syncServerTime } from "../lib/serverTime";
+import { getServerNow, syncServerTime, subscribeServerTime } from "../lib/serverTime";
 import {
   cleanRound2Code,
   parseStoredImplementation,
@@ -90,6 +90,7 @@ function areRound2SessionsEqual(
     left.phase_extension_seconds === right.phase_extension_seconds &&
     left.question_extension_seconds === right.question_extension_seconds &&
     left.coding_extension_seconds === right.coding_extension_seconds &&
+    left.student3_extension_seconds === right.student3_extension_seconds &&
     left.coding_stage === right.coding_stage &&
     left.phase === right.phase &&
     left.phase_started_at === right.phase_started_at &&
@@ -408,24 +409,97 @@ function indentImplementationForEditor(body: string) {
 }
 
 
-function findPythonFunctionEnd(lines: string[], signatureIndex: number) {
-  let bodyStarted = false;
+function findCFunctionEnd(lines: string[], signatureIndex: number): number {
+  let depth = 0;
+  let inBlockComment = false;
 
-  for (let i = signatureIndex + 1; i < lines.length; i++) {
+  for (let i = signatureIndex; i < lines.length; i++) {
     const line = lines[i];
+    let inString = false;
+    let inChar = false;
 
-    if (!line.trim()) continue;
+    for (let c = 0; c < line.length; c++) {
+      const ch = line[c];
+      const next = c + 1 < line.length ? line[c + 1] : "";
 
-    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          c++;
+        }
+        continue;
+      }
 
-    if (indent > 0) {
-      bodyStarted = true;
-      continue;
+      if (inString) {
+        if (ch === "\\") {
+          c++;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (inChar) {
+        if (ch === "\\") {
+          c++;
+        } else if (ch === "'") {
+          inChar = false;
+        }
+        continue;
+      }
+
+      // Check for start of comments
+      if (ch === "/" && next === "/") {
+        break;
+      }
+
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        c++;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (ch === "'") {
+        inChar = true;
+        continue;
+      }
+
+      if (ch === "{") {
+        depth++;
+      } else if (ch === "}") {
+        depth--;
+        if (depth === 0 && i >= signatureIndex) {
+          return i;
+        }
+      }
     }
-
-    if (bodyStarted) return i;
   }
 
+  // If depth never reached 0 (unbalanced braces while student is actively typing),
+  // locate the last line containing only '}' to avoid truncating their unfinished body.
+  for (let i = lines.length - 1; i > signatureIndex; i--) {
+    if (lines[i].trim() === "}") {
+      return i;
+    }
+  }
+
+  // If no closing brace at all is found, the body extends to the end of the document.
+  return -1;
+}
+
+function findPythonFunctionEnd(lines: string[], signatureIndex: number): number {
+  // In Python, a function body continues until the next top-level definition (def or class at col 0)
+  for (let i = signatureIndex + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^(def|class)\s+[a-zA-Z_]/.test(line)) {
+      return i;
+    }
+  }
   return lines.length;
 }
 
@@ -444,12 +518,24 @@ function extractEditorParts(
     ? signature
     : `${signature} {`;
 
-  const signatureIndex = lines.findIndex(
+  let signatureIndex = lines.findIndex(
     (line) => line.trimEnd() === signatureLine,
   );
 
   if (signatureIndex < 0) {
-    return { before: "", body: "", after: "" };
+    signatureIndex = lines.findIndex((line) => {
+      const trimmed = line.trim();
+      return (
+        trimmed === signatureLine.trim() ||
+        (language === "c" && trimmed.startsWith(signature.trim()) && trimmed.endsWith("{")) ||
+        (language === "python" && trimmed === signature.trim())
+      );
+    });
+  }
+
+  if (signatureIndex < 0) {
+    // Never destroy code if signature was slightly reformatted
+    return { before: "", body: document, after: "" };
   }
 
   const before = lines.slice(0, signatureIndex).join("\n");
@@ -470,33 +556,22 @@ function extractEditorParts(
   }
 
   // C: find the matching closing brace for the official function.
-  const signatureText = lines[signatureIndex];
-  let depth = (signatureText.match(/{/g) ?? []).length -
-    (signatureText.match(/}/g) ?? []).length;
-  let endIndex = -1;
+  const endIndex = findCFunctionEnd(lines, signatureIndex);
+  let bodyLines: string[];
+  let afterLines: string[];
 
-  for (let i = signatureIndex + 1; i < lines.length; i++) {
-    depth += (lines[i].match(/{/g) ?? []).length;
-    depth -= (lines[i].match(/}/g) ?? []).length;
-
-    if (depth === 0) {
-      endIndex = i;
-      break;
-    }
-  }
-
-  if (endIndex < 0) {
-    return { before: "", body: "", after: "" };
+  if (endIndex > signatureIndex) {
+    bodyLines = lines.slice(signatureIndex + 1, endIndex);
+    afterLines = lines.slice(endIndex + 1);
+  } else {
+    bodyLines = lines.slice(signatureIndex + 1);
+    afterLines = [];
   }
 
   return {
     before: normalizeImplementationBody(before),
-    body: normalizeImplementationBody(
-      lines.slice(signatureIndex + 1, endIndex).join("\n"),
-    ),
-    after: normalizeImplementationBody(
-      lines.slice(endIndex + 1).join("\n"),
-    ),
+    body: normalizeImplementationBody(bodyLines.join("\n")),
+    after: normalizeImplementationBody(afterLines.join("\n")),
   };
 }
 
@@ -1426,6 +1501,8 @@ export function DashboardPage() {
     useState<ProgrammingLanguage>("c");
   const [code, setCode] = useState("");
   const codeRef = useRef("");
+  const pendingSaveRef = useRef<{ code: string; language: ProgrammingLanguage } | null>(null);
+  const saveCodeRef = useRef<(code?: string, lang?: ProgrammingLanguage) => Promise<void>>(async () => {});
 
   const [codeLoading, setCodeLoading] = useState(false);
   const [codeSaving, setCodeSaving] = useState(false);
@@ -1660,24 +1737,21 @@ export function DashboardPage() {
         const rows = (result.data as TeamCode[]) ?? [];
         const saved = rows[0] ?? null;
 
-        if (!saved) {
+        const cleanSavedCode = cleanRound2Code(saved?.code ?? "");
+
+        if (cleanSavedCode.trim().length > 0) {
+          const savedLanguage =
+            saved?.language === "python" || saved?.language === "c"
+              ? saved.language
+              : "c";
+          setLanguage(savedLanguage);
+          setCode(cleanSavedCode);
+          codeRef.current = cleanSavedCode;
+        } else if (codeRef.current.trim().length === 0) {
           setCode("");
           codeRef.current = "";
-          setLoadedCodeStageKey(
-            `${currentSession.id}:${currentSession.coding_stage ?? "STUDENT_2"}:${currentQuestion.question_id}`,
-          );
-          return;
         }
 
-        const savedLanguage =
-          saved.language === "python" || saved.language === "c"
-            ? saved.language
-            : "c";
-
-        const cleanSavedCode = cleanRound2Code(saved.code ?? "");
-        setLanguage(savedLanguage);
-        setCode(cleanSavedCode);
-        codeRef.current = cleanSavedCode;
         setLoadedCodeStageKey(
           `${currentSession.id}:${currentSession.coding_stage ?? "STUDENT_2"}:${currentQuestion.question_id}`,
         );
@@ -1849,7 +1923,14 @@ export function DashboardPage() {
       (previousPhase.current !== "CODING" || previousCodingStage.current !== stage);
 
     if (enteredCoding && round2Session.phase === "CODING") {
-      void loadTeamCode(team, round2Session, round2Question);
+      void (async () => {
+        if (pendingSaveRef.current) {
+          const toSave = pendingSaveRef.current;
+          pendingSaveRef.current = null;
+          await saveCodeRef.current(toSave.code, toSave.language);
+        }
+        await loadTeamCode(team, round2Session, round2Question);
+      })();
     }
 
     previousPhase.current = round2Session.phase;
@@ -1876,13 +1957,8 @@ export function DashboardPage() {
     }
 
     if (!round2Session.phase_started_at) {
-      const nextRemaining = round2Session.phase === "CODING" ? 0 : null;
-      if (round2Session.phase === "CODING") {
-        expiredCodingStageKeyRef.current =
-          `${round2Session.id}:${round2Session.coding_stage ?? "STUDENT_2"}:missing`;
-      }
-      remainingSecondsRef.current = nextRemaining;
-      setRemainingSeconds(nextRemaining);
+      remainingSecondsRef.current = null;
+      setRemainingSeconds(null);
       return;
     }
 
@@ -1911,23 +1987,9 @@ export function DashboardPage() {
             : Number(round2Session.coding_extension_seconds ?? 0);
 
       const total = base + extension;
-      let nextRemaining = Number.isFinite(start) && Number.isFinite(total)
+      const nextRemaining = Number.isFinite(start) && Number.isFinite(total)
         ? Math.max(0, total - elapsed)
         : 0;
-
-      if (round2Session.phase === "CODING") {
-        const stageKey = `${round2Session.id}:${codingStage}:${round2Session.phase_started_at}`;
-        if (nextRemaining <= 0 || expiredCodingStageKeyRef.current === stageKey) {
-          if (nextRemaining <= 0) {
-            expiredCodingStageKeyRef.current = stageKey;
-            nextRemaining = 0;
-          } else {
-            expiredCodingStageKeyRef.current = null;
-          }
-        }
-      } else {
-        expiredCodingStageKeyRef.current = null;
-      }
 
       remainingSecondsRef.current = nextRemaining;
       setRemainingSeconds(nextRemaining);
@@ -1935,8 +1997,13 @@ export function DashboardPage() {
 
     update();
 
+    const unsubscribeTime = subscribeServerTime(update);
     const interval = window.setInterval(update, 250);
-    return () => window.clearInterval(interval);
+
+    return () => {
+      unsubscribeTime();
+      window.clearInterval(interval);
+    };
   }, [
     round2Session?.phase,
     round2Session?.phase_started_at,
@@ -1974,13 +2041,10 @@ export function DashboardPage() {
         !team ||
         !round2Session ||
         !round2Question ||
-        codingTimeExpired ||
         round2Session.phase !== "CODING" ||
         !["STUDENT_2", "STUDENT_3"].includes(
           round2Session.coding_stage ?? "STUDENT_2",
-        ) ||
-        remainingSecondsRef.current === null ||
-        remainingSecondsRef.current <= 0
+        )
       ) {
         return;
       }
@@ -2022,9 +2086,9 @@ export function DashboardPage() {
       round2Session,
       round2Question,
       language,
-      codingTimeExpired,
     ],
   );
+  saveCodeRef.current = saveCode;
 
   useEffect(() => {
     if (
@@ -2032,19 +2096,19 @@ export function DashboardPage() {
       !round2Session ||
       !round2Question ||
       round2Session.phase !== "CODING" ||
-      codingTimeExpired ||
-      codeLoading ||
-      remainingSecondsRef.current === null ||
-      remainingSecondsRef.current <= 0
+      codeLoading
     ) {
       return;
     }
 
     const timeout = window.setTimeout(() => {
+      pendingSaveRef.current = null;
       void saveCode(codeRef.current, language);
     }, 250);
 
-    return () => window.clearTimeout(timeout);
+    return () => {
+      window.clearTimeout(timeout);
+    };
   }, [
     code,
     language,
@@ -2053,7 +2117,6 @@ export function DashboardPage() {
     round2Question,
     codeLoading,
     saveCode,
-    codingTimeExpired,
   ]);
 
   const handleEditorChange = useCallback((nextImplementation: string) => {
@@ -2067,12 +2130,13 @@ export function DashboardPage() {
     }
 
     codeRef.current = nextImplementation;
+    pendingSaveRef.current = { code: nextImplementation, language };
     setCode(nextImplementation);
     setSubmissionDirty(true);
     setCodeSaveMessage(null);
     setCodeError(null);
     setCodeRunResult(null);
-  }, [codingTimeExpired]);
+  }, [codingTimeExpired, language]);
 
   const handleLanguageChange = (
     nextLanguage: ProgrammingLanguage,
@@ -2194,6 +2258,9 @@ export function DashboardPage() {
     setCodeSaveMessage(null);
 
     try {
+      // Explicitly persist the latest editor code to round2_team_code before submit
+      await saveCode(codeRef.current, language);
+
       // Submit performs a fresh server-side full test run. This is the only
       // request that creates/updates the official 30-mark result.
       const result = await insforge.functions.invoke(

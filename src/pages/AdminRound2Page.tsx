@@ -7,7 +7,7 @@ import {
 
 import { insforge } from "../lib/insforge";
 import { useAuth } from "../context/AuthContext";
-import { getServerNow, syncServerTime } from "../lib/serverTime";
+import { getServerNow, syncServerTime, subscribeServerTime } from "../lib/serverTime";
 import { cleanRound2Code } from "../lib/codeUtils";
 
 type Round2Phase =
@@ -433,7 +433,8 @@ export default function AdminRound2Page() {
           .order("submitted_at", { ascending: false }),
         insforge.database
           .from("round2_team_code")
-          .select("team_id, question_id, language, code, updated_at"),
+          .select("team_id, question_id, language, code, updated_at")
+          .order("updated_at", { ascending: false }),
       ]);
 
       if (resultsRes.data) {
@@ -447,6 +448,49 @@ export default function AdminRound2Page() {
     } finally {
       setLoadingMarks(false);
     }
+  }, []);
+
+  const handleViewOfficialCode = useCallback(async (
+    result: Round2FinalResult,
+    teamNumber: number,
+    teamName: string,
+    questionTitle: string,
+    initialCode: string,
+  ) => {
+    let displayCode = initialCode;
+    let displayLanguage = result.language;
+
+    if (!displayCode || displayCode.trim().length === 0) {
+      try {
+        const runsRes = await insforge.database
+          .from("round2_code_runs")
+          .select("source_code, language")
+          .eq("team_id", result.team_id)
+          .eq("question_id", result.question_id)
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (runsRes.data?.[0]?.source_code) {
+          const runCode = cleanRound2Code(runsRes.data[0].source_code);
+          if (runCode.trim().length > 0) {
+            displayCode = runCode;
+            if (runsRes.data[0].language) {
+              displayLanguage = runsRes.data[0].language;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Fallback code_runs lookup failed:", err);
+      }
+    }
+
+    setViewingCodeModal({
+      teamNumber,
+      teamName,
+      questionTitle,
+      language: displayLanguage,
+      code: displayCode || "// No saved code found",
+    });
   }, []);
 
   /*
@@ -684,13 +728,16 @@ export default function AdminRound2Page() {
 
     updateTimer();
 
+    const unsubscribeTime = subscribeServerTime(updateTimer);
+
     const interval =
       window.setInterval(
         updateTimer,
-        1000,
+        250,
       );
 
     return () => {
+      unsubscribeTime();
       window.clearInterval(
         interval,
       );
@@ -2714,9 +2761,18 @@ export default function AdminRound2Page() {
                   {finalResults.map((result) => {
                     const team = teams.find((t) => t.id === result.team_id);
                     const question = questions.find((q) => q.id === result.question_id);
-                    const matchingCode = teamCodes.find(
-                      (c) => c.team_id === result.team_id && c.question_id === result.question_id,
-                    );
+                    const matchingCode =
+                      teamCodes.find(
+                        (c) =>
+                          c.team_id === result.team_id &&
+                          c.question_id === result.question_id &&
+                          cleanRound2Code(c.code).trim().length > 0,
+                      ) ||
+                      teamCodes.find(
+                        (c) =>
+                          c.team_id === result.team_id &&
+                          c.question_id === result.question_id,
+                      );
                     const cleanCode = cleanRound2Code(matchingCode?.code ?? "");
 
                     return (
@@ -2760,13 +2816,13 @@ export default function AdminRound2Page() {
                           <button
                             type="button"
                             onClick={() => {
-                              setViewingCodeModal({
-                                teamNumber: team?.team_number ?? 0,
-                                teamName: team?.team_name ?? "Team",
-                                questionTitle: question?.title ?? "Question",
-                                language: result.language,
-                                code: cleanCode || "// No saved code found",
-                              });
+                              void handleViewOfficialCode(
+                                result,
+                                team?.team_number ?? 0,
+                                team?.team_name ?? "Team",
+                                question?.title ?? "Question",
+                                cleanCode,
+                              );
                             }}
                             className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-cyan-300 hover:bg-white/10"
                           >

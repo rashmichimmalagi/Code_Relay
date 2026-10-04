@@ -4,6 +4,23 @@ let serverTimeOffsetMs: number | null = null;
 let syncInProgress: Promise<void> | null = null;
 let lastSyncPerfMs = 0;
 
+const listeners = new Set<() => void>();
+
+/**
+ * Subscribe to server time synchronization events.
+ * Triggered as soon as an authoritative clock offset is computed.
+ */
+export function subscribeServerTime(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+export function isServerTimeSynced(): boolean {
+  return serverTimeOffsetMs !== null;
+}
+
 /**
  * Synchronizes the client's clock offset against the authoritative database server.
  * Uses network round-trip time (RTT) midpoint estimation anchored to performance.now().
@@ -31,6 +48,13 @@ export async function syncServerTime(force = false): Promise<void> {
         const midPointPerf = t0 + rtt / 2;
         serverTimeOffsetMs = serverTime - midPointPerf;
         lastSyncPerfMs = performance.now();
+        listeners.forEach((fn) => {
+          try {
+            fn();
+          } catch {
+            // Ignore subscriber error
+          }
+        });
       }
     } catch (err) {
       console.warn("Failed to sync server time, falling back to local clock:", err);
@@ -51,4 +75,9 @@ export function getServerNow(): number {
     return performance.now() + serverTimeOffsetMs;
   }
   return Date.now();
+}
+
+// Automatically initiate eager sync on module load in browser context
+if (typeof window !== "undefined") {
+  void syncServerTime();
 }
